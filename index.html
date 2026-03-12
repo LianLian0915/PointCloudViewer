@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 点云查看器</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: #eee;
+    }
+
+    #app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+
+    #container {
+      width: 100%;
+      height: 100%;
+    }
+
+    #panel {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      width: 340px;
+      padding: 14px 14px 12px;
+      border-radius: 14px;
+      background: rgba(20, 20, 20, 0.86);
+      border: 1px solid rgba(255,255,255,0.08);
+      backdrop-filter: blur(8px);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+
+    #panel h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+    }
+
+    .row {
+      margin-bottom: 10px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      margin-bottom: 4px;
+      color: #bbb;
+    }
+
+    input[type="file"],
+    input[type="range"],
+    select,
+    button {
+      width: 100%;
+    }
+
+    button {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 0;
+      cursor: pointer;
+      background: #2a66ff;
+      color: white;
+      font-size: 14px;
+    }
+
+    button.secondary {
+      background: #2b2b2b;
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .stats {
+      margin-top: 8px;
+      padding: 10px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 10px;
+      font-size: 12px;
+      line-height: 1.7;
+      word-break: break-word;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: #aaa;
+      line-height: 1.5;
+    }
+
+    #loading {
+      position: absolute;
+      right: 16px;
+      top: 16px;
+      z-index: 10;
+      padding: 10px 14px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.75);
+      color: #fff;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="container"></div>
+
+    <div id="panel">
+      <h2>点云查看器</h2>
+
+      <div class="row">
+        <label for="fileInput">加载 PLY 文件</label>
+        <input id="fileInput" type="file" accept=".ply" />
+      </div>
+
+      <div class="row">
+        <label for="pointSize">点大小: <span id="pointSizeValue">0.01</span></label>
+        <input id="pointSize" type="range" min="0.001" max="0.2" step="0.001" value="0.01" />
+      </div>
+
+      <div class="row">
+        <label for="bgMode">背景</label>
+        <select id="bgMode">
+          <option value="dark">深色</option>
+          <option value="light">浅色</option>
+          <option value="blue">科技蓝</option>
+        </select>
+      </div>
+
+      <div class="buttons row">
+        <button id="fitBtn">适配视野</button>
+        <button id="clearBtn" class="secondary">清空点云</button>
+      </div>
+
+      <div class="buttons row">
+        <button id="toggleGridBtn" class="secondary">显示/隐藏网格</button>
+        <button id="toggleAxesBtn" class="secondary">显示/隐藏坐标轴</button>
+      </div>
+
+      <div id="stats" class="stats">
+        尚未加载点云
+      </div>
+
+      <div class="hint">
+        左键旋转，中键缩放，右键平移。<br />
+        单击点云可拾取三维坐标。<br />
+        面板中会显示本次点云加载耗时。
+      </div>
+    </div>
+
+    <div id="loading">正在加载点云...</div>
+  </div>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>
