@@ -18,7 +18,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     w = Editor()
-    w.resize(1360, 860)
+    w.resize(1440, 900)
     w.show()
     sys.exit(app.exec())
 

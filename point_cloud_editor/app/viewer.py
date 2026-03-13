@@ -8,7 +8,9 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 
 from app.camera import Camera
+from app.lod import LODBuilder
 from app.model import PointCloudModel
+from app.selection import box_select_indices, brush_select_indices
 
 try:
     from scipy.spatial import cKDTree  # type: ignore
@@ -27,28 +29,36 @@ class GLViewer(QOpenGLWidget):
         self.setMinimumSize(640, 480)
         self.setMouseTracking(True)
 
-        self.preview_voxel = 0.003
-        self.max_preview_points = 250_000
-        self.use_preview = True
+        self.lod_levels: dict[str, np.ndarray] = {
+            "full": np.zeros((0,), dtype=np.int32),
+            "medium": np.zeros((0,), dtype=np.int32),
+            "preview": np.zeros((0,), dtype=np.int32),
+        }
         self.render_indices = np.zeros((0,), dtype=np.int32)
         self.render_positions = np.zeros((0, 3), dtype=np.float32)
         self.render_colors = np.zeros((0, 3), dtype=np.float32)
         self.render_tree = None
+        self.use_preview = True
 
         self.pos_vbo = None
         self.col_vbo = None
         self.gpu_dirty = True
         self.cache_dirty = True
 
+        self.selection_mode = "point"  # point | box | brush
+        self.dragging_box = False
+        self.box_start = None
+        self.box_end = None
+        self.brush_radius = 20.0
+        self.brush_active = False
+
     def initializeGL(self) -> None:
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glDisable(GL_POINT_SMOOTH)
-
         self.pos_vbo = glGenBuffers(1)
         self.col_vbo = glGenBuffers(1)
-
         version = glGetString(GL_VERSION)
         renderer = glGetString(GL_RENDERER)
         v = version.decode("utf-8", errors="ignore") if version else "unknown"
@@ -79,14 +89,16 @@ class GLViewer(QOpenGLWidget):
         self.gpu_dirty = True
         self.update()
 
-    def set_preview_settings(self, use_preview: bool, voxel: float, max_points: int) -> None:
-        self.use_preview = use_preview
-        self.preview_voxel = max(1e-6, float(voxel))
-        self.max_preview_points = max(1000, int(max_points))
+    def set_selection_mode(self, mode: str) -> None:
+        self.selection_mode = mode
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        self.use_preview = enabled
         self.mark_model_dirty()
 
     def rebuild_render_cache(self) -> None:
-        if self.model.count == 0:
+        alive_idx = self.model.alive_indices()
+        if alive_idx.size == 0:
             self.render_indices = np.zeros((0,), dtype=np.int32)
             self.render_positions = np.zeros((0, 3), dtype=np.float32)
             self.render_colors = np.zeros((0, 3), dtype=np.float32)
@@ -94,18 +106,12 @@ class GLViewer(QOpenGLWidget):
             self.cache_dirty = False
             return
 
-        pos = self.model.positions
-        idx = np.arange(self.model.count, dtype=np.int32)
-
-        if self.use_preview and self.model.count > self.max_preview_points:
-            scaled = np.floor(pos / self.preview_voxel).astype(np.int64)
-            _, unique_idx = np.unique(scaled, axis=0, return_index=True)
-            idx = np.sort(unique_idx.astype(np.int32))
-            if idx.shape[0] > self.max_preview_points:
-                step = max(1, idx.shape[0] // self.max_preview_points)
-                idx = idx[::step][: self.max_preview_points]
-
-        self.render_indices = np.ascontiguousarray(idx, dtype=np.int32)
+        alive_points = self.model.positions[alive_idx]
+        self.lod_levels = LODBuilder.build_lod_levels(alive_points)
+        chosen_alive_local = self.lod_levels["full"] if not self.use_preview else LODBuilder.choose_level(
+            self.lod_levels, alive_points.shape[0], self.camera.dist
+        )
+        self.render_indices = np.ascontiguousarray(alive_idx[chosen_alive_local], dtype=np.int32)
         self.render_positions = np.ascontiguousarray(self.model.positions[self.render_indices], dtype=np.float32)
         self.render_colors = np.ascontiguousarray(self.model.colors[self.render_indices], dtype=np.float32)
 
@@ -123,7 +129,6 @@ class GLViewer(QOpenGLWidget):
     def upload_gpu_buffers(self) -> None:
         if self.cache_dirty:
             self.rebuild_render_cache()
-
         colors = self.render_colors.copy()
         if self.model.selected_count() > 0 and self.render_indices.size > 0:
             sel_mask = self.model.selected[self.render_indices]
@@ -144,7 +149,7 @@ class GLViewer(QOpenGLWidget):
         self.update()
 
     def fit_camera_to_model(self) -> None:
-        if self.model.count == 0:
+        if self.model.alive_count == 0:
             self.camera.center = np.zeros((3,), dtype=np.float32)
             self.camera.dist = 3.0
             return
@@ -181,8 +186,7 @@ class GLViewer(QOpenGLWidget):
         glViewport(0, 0, self.width(), self.height())
         glClearColor(0.1, 0.1, 0.12, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
-        if self.model.count == 0:
+        if self.model.alive_count == 0:
             return
         if self.gpu_dirty or self.cache_dirty:
             self.upload_gpu_buffers()
@@ -193,24 +197,57 @@ class GLViewer(QOpenGLWidget):
         glPointSize(float(self.point_size))
         glEnableClientState(GL_VERTEX_ARRAY)
         glEnableClientState(GL_COLOR_ARRAY)
-
         glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
         glVertexPointer(3, GL_FLOAT, 0, None)
         glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
         glColorPointer(3, GL_FLOAT, 0, None)
-
         glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
-
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glDisableClientState(GL_COLOR_ARRAY)
         glDisableClientState(GL_VERTEX_ARRAY)
 
+        if self.dragging_box and self.box_start is not None and self.box_end is not None:
+            self.draw_overlay_box()
+
+    def draw_overlay_box(self) -> None:
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, self.width(), self.height(), 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+        glColor3f(0.2, 0.8, 1.0)
+        x1, y1 = self.box_start.x(), self.box_start.y()
+        x2, y2 = self.box_end.x(), self.box_end.y()
+        glBegin(GL_LINE_LOOP)
+        glVertex2f(x1, y1)
+        glVertex2f(x2, y1)
+        glVertex2f(x2, y2)
+        glVertex2f(x1, y2)
+        glEnd()
+        glEnable(GL_DEPTH_TEST)
+
     def mousePressEvent(self, e: QMouseEvent) -> None:
         self.last_pos = e.position()
-        if e.button() == Qt.LeftButton and self.model.count > 0:
-            self.pick_point(e.position().x(), e.position().y())
+        if e.button() == Qt.LeftButton:
+            if self.selection_mode == "point":
+                self.pick_point(e.position().x(), e.position().y())
+            elif self.selection_mode == "box":
+                self.dragging_box = True
+                self.box_start = e.position()
+                self.box_end = e.position()
+            elif self.selection_mode == "brush":
+                self.brush_active = True
+                self.brush_select(e.position().x(), e.position().y(), additive=False)
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
+        if self.selection_mode == "box" and self.dragging_box:
+            self.box_end = e.position()
+            self.update()
+            return
+        if self.selection_mode == "brush" and self.brush_active:
+            self.brush_select(e.position().x(), e.position().y(), additive=True)
+            return
         if self.last_pos is None:
             return
         if e.buttons() & Qt.RightButton:
@@ -219,16 +256,24 @@ class GLViewer(QOpenGLWidget):
             self.camera.yaw += dx * 0.01
             self.camera.pitch += dy * 0.01
             self.camera.pitch = max(-1.5, min(1.5, self.camera.pitch))
+            self.cache_dirty = True
             self.update()
         self.last_pos = e.position()
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
+        if self.selection_mode == "box" and self.dragging_box and self.box_start is not None and self.box_end is not None:
+            self.box_select(self.box_start.x(), self.box_start.y(), self.box_end.x(), self.box_end.y())
+        self.dragging_box = False
+        self.brush_active = False
+        self.box_start = None
+        self.box_end = None
         self.last_pos = None
         super().mouseReleaseEvent(e)
 
     def wheelEvent(self, e: QWheelEvent) -> None:
         self.camera.dist += -e.angleDelta().y() * 0.001
         self.camera.dist = max(0.2, min(100000.0, self.camera.dist))
+        self.cache_dirty = True
         self.update()
 
     def project_render_points(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -244,7 +289,6 @@ class GLViewer(QOpenGLWidget):
         x1 = cy * pts[:, 0] + sy * pts[:, 2]
         y1 = pts[:, 1]
         z1 = -sy * pts[:, 0] + cy * pts[:, 2]
-
         x2 = x1
         y2 = cp * y1 - sp * z1
         z2 = sp * y1 + cp * z1 - self.camera.dist
@@ -280,5 +324,27 @@ class GLViewer(QOpenGLWidget):
             self.model.select_raw_index(raw_idx)
             p = self.model.positions[raw_idx]
             self.status_callback(f"已选中点 #{raw_idx}: ({p[0]:.5f}, {p[1]:.5f}, {p[2]:.5f})")
+        self.gpu_dirty = True
+        self.update()
+
+    def box_select(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        if self.cache_dirty:
+            self.rebuild_render_cache()
+        sx, sy, _ = self.project_render_points()
+        idx = box_select_indices(sx, sy, x1, y1, x2, y2)
+        raw_idx = self.render_indices[idx] if idx.size > 0 else np.zeros((0,), dtype=np.int32)
+        count = self.model.select_raw_indices(raw_idx, additive=False)
+        self.status_callback(f"框选点数: {count}")
+        self.gpu_dirty = True
+        self.update()
+
+    def brush_select(self, x: float, y: float, additive: bool = True) -> None:
+        if self.cache_dirty:
+            self.rebuild_render_cache()
+        sx, sy, _ = self.project_render_points()
+        idx = brush_select_indices(sx, sy, x, y, self.brush_radius)
+        raw_idx = self.render_indices[idx] if idx.size > 0 else np.zeros((0,), dtype=np.int32)
+        count = self.model.select_raw_indices(raw_idx, additive=additive)
+        self.status_callback(f"刷选新增点数: {count}")
         self.gpu_dirty = True
         self.update()
