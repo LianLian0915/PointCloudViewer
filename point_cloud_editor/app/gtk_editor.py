@@ -99,6 +99,13 @@ class Editor(Gtk.Window):
         root.pack_start(side, False, False, 6)
         root.pack_start(self.viewer, True, True, 6)
 
+        # auto-generate demo point cloud on startup for quick visual verification
+        try:
+            self.demo()
+        except Exception:
+            # ignore if demo fails (will not block UI)
+            pass
+
     def set_status(self, text: str) -> None:
         self.status.set_text(text)
 

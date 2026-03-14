@@ -1,5 +1,9 @@
-PyGObject
 PyOpenGL
+PyGObject
+moderngl
+numpy
+plyfile
+scipy
 PyOpenGL==3.1.10
 numpy
 plyfile

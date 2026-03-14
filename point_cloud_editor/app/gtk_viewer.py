@@ -7,6 +7,8 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileShader, compileProgram
+import ctypes
+import moderngl
 
 from app.camera import Camera
 from app.lod import LODBuilder
@@ -70,12 +72,18 @@ class GLViewer(Gtk.GLArea):
         self.brush_radius = 20.0
         self.brush_active = False
 
-    self._gl_inited = False
-    # modern GL objects
-    self.shader_program = None
-    self.vao = None
-    self.u_mvp = None
-    self.u_point_size = None
+        self._gl_inited = False
+        # modern GL objects
+        self.shader_program = None
+        self.vao = None
+        self.u_mvp = None
+        self.u_point_size = None
+    # moderngl context and resources
+    self.mgl_ctx = None
+    self.mgl_prog = None
+    self.mgl_vbo_pos = None
+    self.mgl_vbo_col = None
+    self.mgl_vao = None
 
     # --- GL lifecycle ---
     def on_realize(self, widget) -> None:
@@ -97,6 +105,12 @@ class GLViewer(Gtk.GLArea):
 
     def on_render(self, area, ctx) -> bool:
         # called with valid GL context
+        # ensure context is current for PyOpenGL
+        try:
+            self.make_current()
+        except Exception:
+            pass
+
         if not self._gl_inited:
             self.initializeGL()
             self._gl_inited = True
@@ -124,6 +138,7 @@ class GLViewer(Gtk.GLArea):
             self.status_callback(f"OpenGL: {v} | Renderer: {r}")
         except Exception:
             pass
+        print(f"OpenGL: {v} | Renderer: {r}")
         # Try to create a simple shader program for modern GL contexts
         vert_src = '''#version 330
         layout(location = 0) in vec3 in_pos;
@@ -144,10 +159,60 @@ class GLViewer(Gtk.GLArea):
             out_col = vec4(v_col, 1.0);
         }
         '''
+        # Try moderngl first (more robust with Gtk.GLArea contexts)
         try:
-            vs = compileShader(vert_src, GL_VERTEX_SHADER)
-            fs = compileShader(frag_src, GL_FRAGMENT_SHADER)
-            self.shader_program = compileProgram(vs, fs)
+            try:
+                self.mgl_ctx = moderngl.create_context()
+            except Exception:
+                try:
+                    # some versions accept require=False
+                    self.mgl_ctx = moderngl.create_context(require=False)
+                except Exception as e:
+                    print("moderngl 创建上下文失败:", e)
+                    self.mgl_ctx = None
+
+            if self.mgl_ctx is not None:
+                try:
+                    m_vert = """#version 330
+                    in vec3 in_pos;
+                    in vec3 in_col;
+                    uniform mat4 u_mvp;
+                    uniform float u_point_size;
+                    out vec3 v_col;
+                    void main() {
+                        gl_Position = u_mvp * vec4(in_pos, 1.0);
+                        v_col = in_col;
+                        gl_PointSize = u_point_size;
+                    }
+                    """
+                    m_frag = """#version 330
+                    in vec3 v_col;
+                    out vec4 out_col;
+                    void main() {
+                        out_col = vec4(v_col, 1.0);
+                    }
+                    """
+                    self.mgl_prog = self.mgl_ctx.program(vertex_shader=m_vert, fragment_shader=m_frag)
+                    print("moderngl: program 创建成功")
+                except Exception as e:
+                    print("moderngl program 创建失败:", e)
+                    self.mgl_prog = None
+            else:
+                self.mgl_prog = None
+        except Exception:
+            self.mgl_ctx = None
+            self.mgl_prog = None
+
+        try:
+            if self.mgl_prog is None:
+                try:
+                    vs = compileShader(vert_src, GL_VERTEX_SHADER)
+                    fs = compileShader(frag_src, GL_FRAGMENT_SHADER)
+                    self.shader_program = compileProgram(vs, fs)
+                except Exception as e:
+                    # log shader compile/link errors for diagnosis
+                    print("着色器(330) 编译/链接失败:", e)
+                    self.shader_program = None
             # create VAO
             try:
                 self.vao = glGenVertexArrays(1)
@@ -155,26 +220,102 @@ class GLViewer(Gtk.GLArea):
                 # bind buffers and enable attribs (no data yet)
                 glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
                 glEnableVertexAttribArray(0)
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
                 glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
                 glEnableVertexAttribArray(1)
-                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
+                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
                 glBindBuffer(GL_ARRAY_BUFFER, 0)
                 glBindVertexArray(0)
             except Exception:
                 # VAO may not be available; continue without it
+                import traceback
+                print("VAO creation failed:")
+                traceback.print_exc()
                 self.vao = None
-            # get uniform locations
-            self.u_mvp = glGetUniformLocation(self.shader_program, b"u_mvp")
-            self.u_point_size = glGetUniformLocation(self.shader_program, b"u_point_size")
+            # get uniform locations (PyOpenGL path)
+            if self.shader_program is not None:
+                self.u_mvp = glGetUniformLocation(self.shader_program, b"u_mvp")
+                self.u_point_size = glGetUniformLocation(self.shader_program, b"u_point_size")
+            else:
+                self.u_mvp = None
+                self.u_point_size = None
             # enable program point size if supported
             try:
                 glEnable(GL_PROGRAM_POINT_SIZE)
             except Exception:
                 pass
+            # report shader usage (only if compiled)
+            if self.shader_program is not None:
+                try:
+                    self.status_callback("着色器: 使用 GLSL 330")
+                except Exception:
+                    pass
+                print("着色器: 使用 GLSL 330")
+                print(f"VAO={self.vao} pos_vbo={self.pos_vbo} col_vbo={self.col_vbo}")
         except Exception:
             # shader creation failed; we'll fall back to legacy path or clear-only
             self.shader_program = None
+            # try an alternative GLSL version without layout qualifiers (e.g. 130)
+            try:
+                vert130 = '''#version 130
+                in vec3 in_pos;
+                in vec3 in_col;
+                uniform mat4 u_mvp;
+                uniform float u_point_size;
+                out vec3 v_col;
+                void main() {
+                    gl_Position = u_mvp * vec4(in_pos, 1.0);
+                    v_col = in_col;
+                    gl_PointSize = u_point_size;
+                }
+                '''
+                frag130 = '''#version 130
+                in vec3 v_col;
+                out vec4 out_col;
+                void main() {
+                    out_col = vec4(v_col, 1.0);
+                }
+                '''
+                try:
+                    vs130 = compileShader(vert130, GL_VERTEX_SHADER)
+                    fs130 = compileShader(frag130, GL_FRAGMENT_SHADER)
+                    prog = glCreateProgram()
+                    glAttachShader(prog, vs130)
+                    glAttachShader(prog, fs130)
+                except Exception as e:
+                    print("着色器(130) 编译失败:", e)
+                    raise
+                # bind attrib locations for older GLSL without layout qualifiers
+                try:
+                    glBindAttribLocation(prog, 0, b"in_pos")
+                    glBindAttribLocation(prog, 1, b"in_col")
+                except Exception:
+                    pass
+                glLinkProgram(prog)
+                # check link status
+                try:
+                    status = glGetProgramiv(prog, GL_LINK_STATUS)
+                except Exception:
+                    status = 0
+                if status == GL_TRUE:
+                    self.shader_program = prog
+                    # get uniform locations
+                    self.u_mvp = glGetUniformLocation(self.shader_program, b"u_mvp")
+                    self.u_point_size = glGetUniformLocation(self.shader_program, b"u_point_size")
+                    try:
+                        glEnable(GL_PROGRAM_POINT_SIZE)
+                    except Exception:
+                        pass
+                    try:
+                        self.status_callback("着色器: 使用 GLSL 130 兼容模式")
+                    except Exception:
+                        pass
+                    print("着色器: 使用 GLSL 130 兼容模式")
+                else:
+                    # leave shader_program as None
+                    self.shader_program = None
+            except Exception:
+                self.shader_program = None
 
     # --- GL data & drawing ---
     def mark_model_dirty(self) -> None:
@@ -234,6 +375,47 @@ class GLViewer(Gtk.GLArea):
         glBufferData(GL_ARRAY_BUFFER, colors.nbytes, colors, GL_DYNAMIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         self.gpu_dirty = False
+        try:
+            self.status_callback(f"上传到 GPU: {self.render_positions.shape[0]} 个点")
+        except Exception:
+            pass
+        print(f"上传到 GPU: {self.render_positions.shape[0]} 个点")
+
+        # also push to moderngl buffers if available
+        if self.mgl_ctx is not None and self.mgl_prog is not None:
+            try:
+                # release previous buffers
+                if self.mgl_vbo_pos is not None:
+                    try:
+                        self.mgl_vbo_pos.release()
+                    except Exception:
+                        pass
+                if self.mgl_vbo_col is not None:
+                    try:
+                        self.mgl_vbo_col.release()
+                    except Exception:
+                        pass
+                # create new buffers
+                self.mgl_vbo_pos = self.mgl_ctx.buffer(self.render_positions.tobytes())
+                self.mgl_vbo_col = self.mgl_ctx.buffer(colors.tobytes())
+                # release previous vao
+                if self.mgl_vao is not None:
+                    try:
+                        self.mgl_vao.release()
+                    except Exception:
+                        pass
+                # create vertex array object binding program inputs to buffers
+                # program attributes names must match shader: in_pos, in_col
+                self.mgl_vao = self.mgl_ctx.vertex_array(
+                    self.mgl_prog,
+                    [
+                        (self.mgl_vbo_pos, '3f', 'in_pos'),
+                        (self.mgl_vbo_col, '3f', 'in_col'),
+                    ],
+                )
+                print(f"moderngl: 上传到 GPU buffers (n={self.render_positions.shape[0]})")
+            except Exception as e:
+                print("moderngl 上传失败:", e)
 
     def reset_view(self) -> None:
         self.camera.yaw = 0.0
@@ -292,20 +474,165 @@ class GLViewer(Gtk.GLArea):
             self.upload_gpu_buffers()
 
         try:
+            # compute MVP matrix
+            w = max(1, self.get_allocated_width())
+            h = max(1, self.get_allocated_height())
+            aspect = w / h
+            znear = 0.01
+            zfar = 100000.0
+            fovy = 45.0
+            f = 1.0 / math.tan(math.radians(fovy) * 0.5)
+            # perspective matrix
+            proj = np.zeros((4, 4), dtype=np.float32)
+            proj[0, 0] = f / aspect
+            proj[1, 1] = f
+            proj[2, 2] = (zfar + znear) / (znear - zfar)
+            proj[2, 3] = (2 * zfar * znear) / (znear - zfar)
+            proj[3, 2] = -1.0
+
+            # modelview: translate and rotate similar to previous fixed pipeline
+            mv = np.eye(4, dtype=np.float32)
+            # translate -dist on z
+            mv = mv @ np.array([[1,0,0,0],[0,1,0,0],[0,0,1,-self.camera.dist],[0,0,0,1]], dtype=np.float32)
+            # rotate pitch around X
+            cp = math.cos(self.camera.pitch)
+            sp = math.sin(self.camera.pitch)
+            rx = np.array([[1,0,0,0],[0,cp,-sp,0],[0,sp,cp,0],[0,0,0,1]], dtype=np.float32)
+            # rotate yaw around Y
+            cy = math.cos(self.camera.yaw)
+            sy = math.sin(self.camera.yaw)
+            ry = np.array([[cy,0,sy,0],[0,1,0,0],[-sy,0,cy,0],[0,0,0,1]], dtype=np.float32)
+            mv = mv @ rx @ ry
+            # translate by -center
+            trans = np.eye(4, dtype=np.float32)
+            trans[0,3] = -float(self.camera.center[0])
+            trans[1,3] = -float(self.camera.center[1])
+            trans[2,3] = -float(self.camera.center[2])
+            mv = mv @ trans
+
+            mvp = proj @ mv
+
+            try:
+                self.status_callback(f"绘制: n={self.render_positions.shape[0]} center={self.camera.center.tolist()} dist={self.camera.dist:.3f}")
+            except Exception:
+                pass
+            print(f"绘制: n={self.render_positions.shape[0]} center={self.camera.center.tolist()} dist={self.camera.dist:.3f}")
+
+            # Prefer moderngl rendering when available (more robust than PyOpenGL context handling)
+            if self.mgl_prog is not None:
+                try:
+                    if self.gpu_dirty:
+                        self.upload_gpu_buffers()
+                    data = np.ascontiguousarray(mvp, dtype=np.float32).tobytes()
+                    try:
+                        # write uniform (moderngl Program exposes uniforms by name)
+                        self.mgl_prog["u_mvp"].write(data)
+                    except Exception:
+                        # older moderngl may use different access; try attribute-style
+                        try:
+                            self.mgl_prog["u_mvp"].value = tuple(np.ascontiguousarray(mvp, dtype=np.float32).flatten())
+                        except Exception:
+                            pass
+                    try:
+                        if "u_point_size" in self.mgl_prog:
+                            self.mgl_prog["u_point_size"].value = float(self.point_size)
+                    except Exception:
+                        pass
+                    if self.mgl_vao is not None:
+                        self.mgl_vao.render(mode=moderngl.POINTS)
+                    else:
+                        print("moderngl: 没有可用的 VAO")
+                except Exception as e:
+                    print("moderngl 渲染失败:", e)
+                # draw overlay if needed (overlay uses legacy GL calls; try but ignore failures)
+                if self.dragging_box and self.box_start is not None and self.box_end is not None:
+                    try:
+                        self.draw_overlay_box()
+                    except Exception:
+                        pass
+                return
+
+            # Prefer shader-based rendering when available
+            if self.shader_program is not None:
+                try:
+                    # ensure buffers uploaded
+                    if self.gpu_dirty:
+                        self.upload_gpu_buffers()
+
+                    # set uniforms (MVP computed above)
+                    data = np.ascontiguousarray(mvp, dtype=np.float32).flatten()
+                    glUseProgram(self.shader_program)
+                    if self.u_mvp is not None:
+                        glUniformMatrix4fv(self.u_mvp, 1, GL_FALSE, data)
+                    if self.u_point_size is not None:
+                        glUniform1f(self.u_point_size, float(self.point_size))
+
+                    # bind and draw
+                    if self.vao:
+                        glBindVertexArray(self.vao)
+                        glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
+                        glBindVertexArray(0)
+                    else:
+                        glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
+                        glEnableVertexAttribArray(0)
+                        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+                        glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
+                        glEnableVertexAttribArray(1)
+                        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+                        glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
+                        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+                    glUseProgram(0)
+                except Exception:
+                    try:
+                        self.status_callback("警告: 着色器渲染失败，尝试固定管线")
+                    except Exception:
+                        pass
+                    import traceback
+                    import sys
+
+                    exc = sys.exc_info()
+                    print("警告: 着色器渲染失败，尝试固定管线", exc[1])
+                    traceback.print_exc()
+                    try:
+                        err = glGetError()
+                        print("glGetError:", err)
+                    except Exception:
+                        pass
+                    # fall back to fixed-function below
+                # If shader succeeded we drawn and can draw overlay (skip legacy matrices)
+                if self.dragging_box and self.box_start is not None and self.box_end is not None:
+                    # overlay drawing relies on legacy matrix calls; try but ignore failures
+                    try:
+                        self.draw_overlay_box()
+                    except Exception:
+                        pass
+                # shader path done
+                return
+
+            # Fixed-function fallback (may not be supported on core-profile contexts)
+            # setup projection/modelview using legacy calls for fixed-pipeline rendering
             self.setup_projection()
             self.setup_modelview()
-
-            glPointSize(float(self.point_size))
-            glEnableClientState(GL_VERTEX_ARRAY)
-            glEnableClientState(GL_COLOR_ARRAY)
-            glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
-            glVertexPointer(3, GL_FLOAT, 0, None)
-            glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
-            glColorPointer(3, GL_FLOAT, 0, None)
-            glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-            glDisableClientState(GL_COLOR_ARRAY)
-            glDisableClientState(GL_VERTEX_ARRAY)
+            try:
+                glPointSize(float(self.point_size))
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glEnableClientState(GL_COLOR_ARRAY)
+                glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
+                glVertexPointer(3, GL_FLOAT, 0, ctypes.c_void_p(0))
+                glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
+                glColorPointer(3, GL_FLOAT, 0, ctypes.c_void_p(0))
+                glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                glDisableClientState(GL_COLOR_ARRAY)
+                glDisableClientState(GL_VERTEX_ARRAY)
+            except Exception:
+                # if even fallback fails, warn and return
+                try:
+                    self.status_callback("警告: 固定管线渲染不可用，无法显示点云")
+                except Exception:
+                    pass
+                print("警告: 固定管线渲染不可用，无法显示点云")
 
             if self.dragging_box and self.box_start is not None and self.box_end is not None:
                 self.draw_overlay_box()
@@ -315,6 +642,7 @@ class GLViewer(Gtk.GLArea):
                 self.status_callback("警告: 当前 GL 上下文不支持固定管线渲染，已启用降级视图")
             except Exception:
                 pass
+            print("警告: 当前 GL 上下文不支持固定管线渲染，已启用降级视图")
             return
 
     def draw_overlay_box(self) -> None:

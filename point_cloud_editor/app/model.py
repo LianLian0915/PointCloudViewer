@@ -89,26 +89,31 @@ class PointCloudModel:
     def mark_selected_deleted(self) -> int:
         mask = self.selected & ~self.deleted_mask
         removed = int(np.count_nonzero(mask))
+        indices = np.where(mask)[0].astype(np.int32)
         if removed > 0:
             self.deleted_mask[mask] = True
             self.selected[:] = False
-        return removed
+        return removed, indices
 
     def move_selected(self, dx: float, dy: float, dz: float) -> int:
         mask = self.selected & ~self.deleted_mask
         moved = int(np.count_nonzero(mask))
+        indices = np.where(mask)[0].astype(np.int32)
         if moved > 0:
             self.positions[mask] += np.array([dx, dy, dz], dtype=np.float32)
             self.positions = np.ascontiguousarray(self.positions, dtype=np.float32)
-        return moved
+        return moved, indices
 
     def compact_deleted(self) -> int:
         if self.count == 0:
-            return 0
+            return 0, np.zeros((0,3), dtype=np.float32), np.zeros((0,3), dtype=np.float32), np.zeros((0,), dtype=bool)
         keep = ~self.deleted_mask
         removed = int(np.count_nonzero(self.deleted_mask))
+        old_pos = np.ascontiguousarray(self.positions[~keep], dtype=np.float32) if removed > 0 else np.zeros((0,3), dtype=np.float32)
+        old_col = np.ascontiguousarray(self.colors[~keep], dtype=np.float32) if removed > 0 else np.zeros((0,3), dtype=np.float32)
+        old_deleted = np.ascontiguousarray(self.deleted_mask, dtype=bool)
         self.positions = np.ascontiguousarray(self.positions[keep], dtype=np.float32)
         self.colors = np.ascontiguousarray(self.colors[keep], dtype=np.float32)
         self.selected = np.zeros((self.positions.shape[0],), dtype=bool)
         self.deleted_mask = np.zeros((self.positions.shape[0],), dtype=bool)
-        return removed
+        return removed, old_pos, old_col, old_deleted
