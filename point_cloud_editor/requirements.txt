@@ -1,4 +1,5 @@
-PySide6==6.10.2
+PyGObject
+PyOpenGL
 PyOpenGL==3.1.10
 numpy
 plyfile
