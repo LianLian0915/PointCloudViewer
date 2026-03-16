@@ -70,12 +70,12 @@ class GLViewer(Gtk.GLArea):
         self.brush_radius = 20.0
         self.brush_active = False
 
-    self._gl_inited = False
-    # modern GL objects
-    self.shader_program = None
-    self.vao = None
-    self.u_mvp = None
-    self.u_point_size = None
+        self._gl_inited = False
+        # modern GL objects
+        self.shader_program = None
+        self.vao = None
+        self.u_mvp = None
+        self.u_point_size = None
 
     # --- GL lifecycle ---
     def on_realize(self, widget) -> None:
