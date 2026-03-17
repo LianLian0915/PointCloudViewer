@@ -15,6 +15,7 @@ OpenGL.ALLOW_NUMPY_FUNCTIONS = False  # Don't use numpy arrays which might trigg
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileShader, compileProgram
 from numpy.typing import NDArray
+import moderngl
 
 from app.camera import Camera
 from app.lod import LODBuilder
@@ -29,21 +30,28 @@ except Exception:
 
 def create_projection_matrix(fovy: float, aspect: float, znear: float, zfar: float) -> NDArray:
     """Create a perspective projection matrix (CPU-side)."""
+    # Standard perspective projection matrix
+    # fovy is in degrees
     f = 1.0 / math.tan(math.radians(fovy) * 0.5)
     result = np.zeros((4, 4), dtype=np.float32)
     result[0, 0] = f / aspect
     result[1, 1] = f
     result[2, 2] = (zfar + znear) / (znear - zfar)
-    result[2, 3] = -1.0
-    result[3, 2] = (2.0 * zfar * znear) / (znear - zfar)
+    result[2, 3] = (2.0 * zfar * znear) / (znear - zfar)
+    result[3, 2] = -1.0
     return result
 
 
 def create_view_matrix(camera: 'Camera') -> NDArray:
     """Create a view matrix from camera (CPU-side)."""
-    # Translate to camera distance along -Z
+    # Build view matrix: translate to -center, rotate, then move back by camera distance
+    # Standard order: V = T(0,0,-dist) * Ry(yaw) * Rx(pitch) * T(-center)
+    
+    # First translate to remove center
     view = np.eye(4, dtype=np.float32)
-    view[2, 3] = -camera.dist
+    view[0, 3] = -camera.center[0]
+    view[1, 3] = -camera.center[1]
+    view[2, 3] = -camera.center[2]
     
     # Rotate around X axis (pitch)
     pitch_rad = camera.pitch
@@ -65,12 +73,10 @@ def create_view_matrix(camera: 'Camera') -> NDArray:
     yaw_mat[2, 2] = cy
     view = yaw_mat @ view
     
-    # Translate to center
-    center_mat = np.eye(4, dtype=np.float32)
-    center_mat[0, 3] = -camera.center[0]
-    center_mat[1, 3] = -camera.center[1]
-    center_mat[2, 3] = -camera.center[2]
-    view = view @ center_mat
+    # Finally, translate along -Z by camera distance
+    dist_mat = np.eye(4, dtype=np.float32)
+    dist_mat[2, 3] = -camera.dist
+    view = dist_mat @ view
     
     return view
 
@@ -144,6 +150,13 @@ class GLViewer(Gtk.GLArea):
         self.vao_setup_deferred = False
         self.u_mvp = None
         self.u_point_size = None
+        # ModernGL context and objects
+        self.mgl_ctx = None
+        self.mgl_prog = None
+        self.mgl_pos_vbo = None
+        self.mgl_col_vbo = None
+        self.mgl_vao = None
+        self.moderngl_enabled = True
 
     # --- GL lifecycle ---
     def on_realize(self, widget) -> None:
@@ -261,75 +274,45 @@ class GLViewer(Gtk.GLArea):
         }
         '''
             try:
-                vs = compileShader(vert_src, GL_VERTEX_SHADER)
-                fs = compileShader(frag_src, GL_FRAGMENT_SHADER)
-                
-                # Create program
-                self.shader_program = glCreateProgram()
-                glAttachShader(self.shader_program, vs)
-                glAttachShader(self.shader_program, fs)
-                
-                # Bind attributes BEFORE linking
-                glBindAttribLocation(self.shader_program, 0, "in_pos")
-                glBindAttribLocation(self.shader_program, 1, "in_col")
-                
-                # Link
-                glLinkProgram(self.shader_program)
-                
-                # Check link status
-                link_status = glGetProgramiv(self.shader_program, GL_LINK_STATUS)
-                if not link_status:
-                    error_log = glGetProgramInfoLog(self.shader_program)
-                    print(f"[GLViewer.initializeGL] Shader link error: {error_log}")
-                
-                glDeleteShader(vs)
-                glDeleteShader(fs)
-                
-                print("[GLViewer.initializeGL] Shader program created successfully with attributes bound")
-                # create VAO and setup immediately
+                # Initialize ModernGL context from the current GL context
                 try:
-                    self.vao = glGenVertexArrays(1)
-                    print(f"[GLViewer.initializeGL] Generated VAO: {self.vao}")
-                    
-                    # Try to setup VAO immediately (might fail due to context issues, but worth a try)
-                    try:
-                        glBindVertexArray(self.vao)
-                        print(f"[GLViewer.initializeGL] Bound VAO in initializeGL")
-                        
-                        glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
-                        glEnableVertexAttribArray(0)
-                        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
-                        print(f"[GLViewer.initializeGL] Position attribute setup")
-                        
-                        glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
-                        glEnableVertexAttribArray(1)
-                        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
-                        print(f"[GLViewer.initializeGL] Color attribute setup")
-                        
-                        glBindBuffer(GL_ARRAY_BUFFER, 0)
-                        glBindVertexArray(0)
-                        print(f"[GLViewer.initializeGL] VAO setup complete in initializeGL!")
-                        self.vao_setup_deferred = False
-                    except Exception as e:
-                        print(f"[GLViewer.initializeGL] VAO attribute setup failed, will try in on_render: {e}")
-                        # Mark for deferred setup
-                        self.vao_setup_deferred = True
-                except Exception as e:
-                    # VAO generation failed
-                    print(f"[GLViewer.initializeGL] VAO generation failed: {e}")
-                    self.vao = None
-                    self.vao_setup_deferred = False
-                # get uniform locations
-                self.u_mvp = glGetUniformLocation(self.shader_program, b"u_mvp")
-                self.u_point_size = glGetUniformLocation(self.shader_program, b"u_point_size")
-                # enable program point size if supported
-                try:
-                    glEnable(GL_PROGRAM_POINT_SIZE)
+                    self.make_current()
                 except Exception:
                     pass
+                try:
+                    self.mgl_ctx = moderngl.create_context()
+                    print(f"[GLViewer.initializeGL] ModernGL context created: {self.mgl_ctx}")
+                except Exception as e:
+                    print(f"[GLViewer.initializeGL] ModernGL context creation failed: {e}")
+                    self.mgl_ctx = None
+
+                if self.mgl_ctx is not None:
+                    # Create ModernGL program (shader)
+                    try:
+                        self.mgl_prog = self.mgl_ctx.program(vertex_shader=vert_src, fragment_shader=frag_src)
+                        print("[GLViewer.initializeGL] ModernGL program created")
+
+                        # Create buffers with minimal size (VAO will be created in upload_gpu_buffers when data is available)
+                        self.mgl_pos_vbo = self.mgl_ctx.buffer(reserve=12)  # Minimum size for 1 point
+                        self.mgl_col_vbo = self.mgl_ctx.buffer(reserve=12)  # Minimum size for 1 point
+                        print("[GLViewer.initializeGL] ModernGL buffers created")
+
+                        # VAO will be created in upload_gpu_buffers when we have actual data
+                        self.mgl_vao = None
+
+                        # Enable program point size if supported
+                        try:
+                            glEnable(GL_PROGRAM_POINT_SIZE)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[GLViewer.initializeGL] ModernGL program creation failed: {e}")
+                        self.mgl_prog = None
+                else:
+                    print("[GLViewer.initializeGL] ModernGL unavailable, will attempt PyOpenGL fallback")
+                    self.mgl_prog = None
             except Exception as e:
-                # shader creation failed; we'll fall back to legacy path or clear-only
-                print(f"[GLViewer.initializeGL] Shader creation failed: {e}, will use fixed-function")
+                print(f"[GLViewer.initializeGL] Shader creation failed: {e}, will use fixed-function or fallback")
                 self.shader_program = None
         except Exception as e:
             print(f"[GLViewer.initializeGL] Critical error: {e}")
@@ -405,6 +388,41 @@ class GLViewer(Gtk.GLArea):
         glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
         glBufferData(GL_ARRAY_BUFFER, colors.nbytes, colors, GL_DYNAMIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
+        # Also update ModernGL buffers if available
+        try:
+            if self.mgl_ctx is not None and self.mgl_pos_vbo is not None and self.mgl_prog is not None:
+                # ensure contiguous float32
+                pos_bytes = np.ascontiguousarray(self.render_positions, dtype=np.float32).tobytes()
+                col_bytes = np.ascontiguousarray(colors, dtype=np.float32).tobytes()
+                # Recreate or write depending on buffer size
+                try:
+                    self.mgl_pos_vbo.orphan(len(pos_bytes))
+                except Exception:
+                    pass
+                try:
+                    self.mgl_col_vbo.orphan(len(col_bytes))
+                except Exception:
+                    pass
+                try:
+                    self.mgl_pos_vbo.write(pos_bytes)
+                    self.mgl_col_vbo.write(col_bytes)
+                    print(f"[GLViewer.upload_gpu_buffers] ModernGL buffers updated: pos={len(pos_bytes)} bytes, col={len(col_bytes)} bytes")
+                except Exception as e:
+                    print(f"[GLViewer.upload_gpu_buffers] ModernGL buffer write failed: {e}")
+                
+                # Create VAO if not already created (after we have data in buffers)
+                if self.mgl_vao is None and len(pos_bytes) > 0:
+                    try:
+                        self.mgl_vao = self.mgl_ctx.vertex_array(
+                            self.mgl_prog,
+                            [(self.mgl_pos_vbo, '3f', 'in_pos'), (self.mgl_col_vbo, '3f', 'in_col')],
+                        )
+                        print(f"[GLViewer.upload_gpu_buffers] ModernGL VAO created on first data upload: {self.mgl_vao}")
+                    except Exception as e:
+                        print(f"[GLViewer.upload_gpu_buffers] ModernGL VAO creation failed: {e}")
+                        self.mgl_vao = None
+        except Exception:
+            pass
         self.gpu_dirty = False
 
     def reset_view(self) -> None:
@@ -488,45 +506,71 @@ class GLViewer(Gtk.GLArea):
             self.upload_gpu_buffers()
 
         try:
-            # Transform vertices on CPU side and upload to GPU
+            # Transform vertices on CPU side
             print(f"[GLViewer.paintGL] Transforming {self.render_positions.shape[0]} vertices on CPU")
             transformed_positions = self.get_transformed_positions()
-            print(f"[GLViewer.paintGL] Uploading transformed positions to pos_vbo")
-            glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
-            glBufferData(GL_ARRAY_BUFFER, transformed_positions.nbytes, transformed_positions, GL_DYNAMIC_DRAW)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-            print(f"[GLViewer.paintGL] Transformed positions uploaded")
-            
-            # Use shader pipeline
+
+            # Upload transformed positions to PyOpenGL VBO (fallback)
+            try:
+                print(f"[GLViewer.paintGL] Uploading transformed positions to pos_vbo")
+                glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
+                glBufferData(GL_ARRAY_BUFFER, transformed_positions.nbytes, transformed_positions, GL_DYNAMIC_DRAW)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                print(f"[GLViewer.paintGL] Transformed positions uploaded (GL)")
+            except Exception:
+                pass
+
+            # If ModernGL is available, write transformed positions into its buffer and render via VAO
+            if self.mgl_ctx is not None and self.mgl_vao is not None:
+                try:
+                    pos_bytes = np.ascontiguousarray(transformed_positions, dtype=np.float32).tobytes()
+                    col_bytes = np.ascontiguousarray(self.render_colors, dtype=np.float32).tobytes()
+                    try:
+                        self.mgl_pos_vbo.orphan(len(pos_bytes))
+                    except Exception:
+                        pass
+                    try:
+                        self.mgl_col_vbo.orphan(len(col_bytes))
+                    except Exception:
+                        pass
+                    self.mgl_pos_vbo.write(pos_bytes)
+                    self.mgl_col_vbo.write(col_bytes)
+
+                    # set point size uniform if present
+                    try:
+                        if 'u_point_size' in self.mgl_prog:
+                            self.mgl_prog['u_point_size'].value = float(self.point_size)
+                    except Exception:
+                        pass
+
+                    # Render using ModernGL VAO
+                    print(f"[GLViewer.paintGL] ModernGL rendering {int(self.render_positions.shape[0])} points")
+                    self.mgl_vao.render(mode=moderngl.POINTS)
+                    print("[GLViewer.paintGL] ModernGL render complete")
+                    return
+                except Exception as e:
+                    print(f"[GLViewer.paintGL] ModernGL render failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Fallback: attempt to use existing PyOpenGL shader path
             if not self.shader_program:
-                print("[GLViewer.paintGL] Shader program not available")
+                print("[GLViewer.paintGL] Shader program not available (fallback)")
                 return
             
-            print("[GLViewer.paintGL] Using shader pipeline with CPU-transformed vertices")
-            
-            # Use shader
+            print("[GLViewer.paintGL] Using PyOpenGL shader fallback")
             glUseProgram(self.shader_program)
-            print(f"[GLViewer.paintGL] glUseProgram OK, program={self.shader_program}")
-            
-            # Set point size uniform
             point_size_loc = glGetUniformLocation(self.shader_program, "u_point_size")
             glUniform1f(point_size_loc, float(self.point_size))
-            print(f"[GLViewer.paintGL] Point size uniform set OK")
-            
-            # Render using VAO if available
+            # Draw with existing VAO if possible
             if self.vao and self.vao > 0:
-                print(f"[GLViewer.paintGL] Using VAO {self.vao}")
                 glBindVertexArray(self.vao)
-                print(f"[GLViewer.paintGL] Drawing {int(self.render_positions.shape[0])} points with VAO")
                 glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
                 glBindVertexArray(0)
             else:
-                print(f"[GLViewer.paintGL] No VAO available, drawing without vertex attributes")
-                print(f"[GLViewer.paintGL] Drawing {int(self.render_positions.shape[0])} points (will appear as empty)")
                 glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
-            
             glUseProgram(0)
-            print("[GLViewer.paintGL] Successfully rendered!")
+            print("[GLViewer.paintGL] Fallback render complete")
 
             if self.dragging_box and self.box_start is not None and self.box_end is not None:
                 self.draw_overlay_box()

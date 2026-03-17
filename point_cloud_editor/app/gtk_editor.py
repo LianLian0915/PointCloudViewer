@@ -14,7 +14,7 @@ from app.gtk_viewer import GLViewer
 class Editor(Gtk.Window):
     def __init__(self) -> None:
         super().__init__()
-        self.set_title("Enhanced Point Cloud Editor (GTK3 + PyOpenGL)")
+        self.set_title("Point Cloud Editor (GTK3 + ModernGL)")
         self.model = PointCloudModel()
         self.history = HistoryStack(max_size=50)
 
