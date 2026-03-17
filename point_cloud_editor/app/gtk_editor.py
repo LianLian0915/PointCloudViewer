@@ -202,15 +202,21 @@ class Editor(Gtk.Window):
             self.set_status(f"导出失败: {e}")
 
     def demo(self) -> None:
+        print("[Editor.demo] Loading demo point cloud")
         x = np.linspace(-0.5, 0.5, 200, dtype=np.float32)
         z = np.linspace(-0.5, 0.5, 200, dtype=np.float32)
         gx, gz = np.meshgrid(x, z)
         gy = np.sin((gx + gz) * 10.0) * 0.05
         pos = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(np.float32)
         col = np.ones_like(pos, dtype=np.float32) * np.array([0.2, 0.8, 1.0], dtype=np.float32)
+        print(f"[Editor.demo] Setting data: {pos.shape[0]} points")
         self.model.set_data(pos, col)
+        print(f"[Editor.demo] Model alive_count: {self.model.alive_count}")
         self.viewer.fit_camera_to_model()
+        print(f"[Editor.demo] Camera: center={self.viewer.camera.center}, dist={self.viewer.camera.dist}")
         self.viewer.mark_model_dirty()
+        print("[Editor.demo] Model marked dirty, requesting redraw")
+        self.viewer.queue_draw()  # explicitly request a redraw
         self.set_status(f"已生成示例点云，原始点数: {self.model.count}")
 
     def mark_delete_selected(self) -> None:

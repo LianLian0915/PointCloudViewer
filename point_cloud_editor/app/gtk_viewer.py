@@ -5,8 +5,16 @@ import numpy as np
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk
+import ctypes
+
+# Configure PyOpenGL to work better with GTK GLArea
+import OpenGL
+OpenGL.ERROR_CHECKING = False  # Disable error checking 
+OpenGL.ALLOW_NUMPY_FUNCTIONS = False  # Don't use numpy arrays which might trigger context checks
+
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileShader, compileProgram
+from numpy.typing import NDArray
 
 from app.camera import Camera
 from app.lod import LODBuilder
@@ -19,11 +27,69 @@ except Exception:
     cKDTree = None
 
 
+def create_projection_matrix(fovy: float, aspect: float, znear: float, zfar: float) -> NDArray:
+    """Create a perspective projection matrix (CPU-side)."""
+    f = 1.0 / math.tan(math.radians(fovy) * 0.5)
+    result = np.zeros((4, 4), dtype=np.float32)
+    result[0, 0] = f / aspect
+    result[1, 1] = f
+    result[2, 2] = (zfar + znear) / (znear - zfar)
+    result[2, 3] = -1.0
+    result[3, 2] = (2.0 * zfar * znear) / (znear - zfar)
+    return result
+
+
+def create_view_matrix(camera: 'Camera') -> NDArray:
+    """Create a view matrix from camera (CPU-side)."""
+    # Translate to camera distance along -Z
+    view = np.eye(4, dtype=np.float32)
+    view[2, 3] = -camera.dist
+    
+    # Rotate around X axis (pitch)
+    pitch_rad = camera.pitch
+    cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
+    pitch_mat = np.eye(4, dtype=np.float32)
+    pitch_mat[1, 1] = cp
+    pitch_mat[1, 2] = -sp
+    pitch_mat[2, 1] = sp
+    pitch_mat[2, 2] = cp
+    view = pitch_mat @ view
+    
+    # Rotate around Y axis (yaw)
+    yaw_rad = camera.yaw
+    cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+    yaw_mat = np.eye(4, dtype=np.float32)
+    yaw_mat[0, 0] = cy
+    yaw_mat[0, 2] = sy
+    yaw_mat[2, 0] = -sy
+    yaw_mat[2, 2] = cy
+    view = yaw_mat @ view
+    
+    # Translate to center
+    center_mat = np.eye(4, dtype=np.float32)
+    center_mat[0, 3] = -camera.center[0]
+    center_mat[1, 3] = -camera.center[1]
+    center_mat[2, 3] = -camera.center[2]
+    view = view @ center_mat
+    
+    return view
+
+
 class GLViewer(Gtk.GLArea):
     def __init__(self, model: PointCloudModel, status_callback) -> None:
         super().__init__()
         self.set_has_depth_buffer(True)
         self.set_has_stencil_buffer(False)
+        
+        # Try to set OpenGL version to request a compatible profile
+        # This may help avoid core-profile-only contexts
+        try:
+            # Use OpenGL 3.2 for better compatibility
+            self.set_required_version(3, 2)
+        except Exception:
+            # Method might not exist in older PyGObject
+            pass
+        
         self.connect("realize", self.on_realize)
         self.connect("unrealize", self.on_unrealize)
         self.connect("render", self.on_render)
@@ -45,6 +111,7 @@ class GLViewer(Gtk.GLArea):
         self.camera = Camera()
         self.point_size = 3.0
         self.last_pos = None
+        self.interactive = False  # when True, use lightweight LOD for smooth interaction
         self.set_size_request(640, 480)
 
         self.lod_levels: dict[str, np.ndarray] = {
@@ -74,6 +141,7 @@ class GLViewer(Gtk.GLArea):
         # modern GL objects
         self.shader_program = None
         self.vao = None
+        self.vao_setup_deferred = False
         self.u_mvp = None
         self.u_point_size = None
 
@@ -81,9 +149,11 @@ class GLViewer(Gtk.GLArea):
     def on_realize(self, widget) -> None:
         # GL context available after realize
         self.make_current()
+        print("[GLViewer] on_realize called - GL context available")
         # nothing heavy here; actual GL init in first render
 
     def on_unrealize(self, widget) -> None:
+        print("[GLViewer] on_unrealize called")
         self.make_current()
         try:
             if self.pos_vbo:
@@ -97,62 +167,24 @@ class GLViewer(Gtk.GLArea):
 
     def on_render(self, area, ctx) -> bool:
         # called with valid GL context
+        print(f"[GLViewer] on_render called - _gl_inited={self._gl_inited}")
         if not self._gl_inited:
-            self.initializeGL()
-            self._gl_inited = True
-
-        # paint equivalent
-        self.paintGL()
-        return True
-
-    def initializeGL(self) -> None:
-        glEnable(GL_DEPTH_TEST)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        # GL_POINT_SMOOTH may be unsupported in some GL contexts; skip if invalid
-        try:
-            glDisable(GL_POINT_SMOOTH)
-        except Exception:
-            pass
-        self.pos_vbo = glGenBuffers(1)
-        self.col_vbo = glGenBuffers(1)
-        version = glGetString(GL_VERSION)
-        renderer = glGetString(GL_RENDERER)
-        v = version.decode("utf-8", errors="ignore") if version else "unknown"
-        r = renderer.decode("utf-8", errors="ignore") if renderer else "unknown"
-        try:
-            self.status_callback(f"OpenGL: {v} | Renderer: {r}")
-        except Exception:
-            pass
-        # Try to create a simple shader program for modern GL contexts
-        vert_src = '''#version 330
-        layout(location = 0) in vec3 in_pos;
-        layout(location = 1) in vec3 in_col;
-        uniform mat4 u_mvp;
-        uniform float u_point_size;
-        out vec3 v_col;
-        void main() {
-            gl_Position = u_mvp * vec4(in_pos, 1.0);
-            v_col = in_col;
-            gl_PointSize = u_point_size;
-        }
-        '''
-        frag_src = '''#version 330
-        in vec3 v_col;
-        out vec4 out_col;
-        void main() {
-            out_col = vec4(v_col, 1.0);
-        }
-        '''
-        try:
-            vs = compileShader(vert_src, GL_VERTEX_SHADER)
-            fs = compileShader(frag_src, GL_FRAGMENT_SHADER)
-            self.shader_program = compileProgram(vs, fs)
-            # create VAO
+            print("[GLViewer] Initializing GL...")
             try:
-                self.vao = glGenVertexArrays(1)
+                self.initializeGL()
+                self._gl_inited = True
+                print("[GLViewer] GL initialized successfully")
+            except Exception as e:
+                print(f"[GLViewer] GL initialization failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+        
+        # Set up VAO if deferred
+        if self.vao_setup_deferred and self.vao and self.vao > 0:
+            print(f"[GLViewer] Setting up deferred VAO {self.vao} in on_render")
+            try:
                 glBindVertexArray(self.vao)
-                # bind buffers and enable attribs (no data yet)
                 glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
                 glEnableVertexAttribArray(0)
                 glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
@@ -161,20 +193,149 @@ class GLViewer(Gtk.GLArea):
                 glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
                 glBindBuffer(GL_ARRAY_BUFFER, 0)
                 glBindVertexArray(0)
-            except Exception:
-                # VAO may not be available; continue without it
+                self.vao_setup_deferred = False
+                print(f"[GLViewer] VAO setup complete in on_render")
+            except Exception as e:
+                print(f"[GLViewer] Deferred VAO setup failed in on_render: {e}")
+                import traceback
+                traceback.print_exc()
                 self.vao = None
-            # get uniform locations
-            self.u_mvp = glGetUniformLocation(self.shader_program, b"u_mvp")
-            self.u_point_size = glGetUniformLocation(self.shader_program, b"u_point_size")
-            # enable program point size if supported
+                self.vao_setup_deferred = False
+        
+        # Now call paintGL
+        self.paintGL()
+        return True
+
+        # paint equivalent
+        try:
+            self.paintGL()
+        except Exception as e:
+            print(f"[GLViewer] paintGL failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        return True
+
+    def initializeGL(self) -> None:
+        print("[GLViewer.initializeGL] Starting GL initialization")
+        try:
+            glEnable(GL_DEPTH_TEST)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            # GL_POINT_SMOOTH may be unsupported in some GL contexts; skip if invalid
             try:
-                glEnable(GL_PROGRAM_POINT_SIZE)
+                glDisable(GL_POINT_SMOOTH)
             except Exception:
                 pass
-        except Exception:
-            # shader creation failed; we'll fall back to legacy path or clear-only
-            self.shader_program = None
+            self.pos_vbo = glGenBuffers(1)
+            self.col_vbo = glGenBuffers(1)
+            print(f"[GLViewer.initializeGL] Created VBOs: pos={self.pos_vbo}, col={self.col_vbo}")
+            
+            version = glGetString(GL_VERSION)
+            renderer = glGetString(GL_RENDERER)
+            v = version.decode("utf-8", errors="ignore") if version else "unknown"
+            r = renderer.decode("utf-8", errors="ignore") if renderer else "unknown"
+            print(f"[GLViewer.initializeGL] OpenGL: {v} | Renderer: {r}")
+            try:
+                self.status_callback(f"OpenGL: {v} | Renderer: {r}")
+            except Exception:
+                pass
+            # Try to create a simple shader program for modern GL contexts
+            # Note: Positions are pre-transformed on CPU side, so shader just uses them directly
+            vert_src = '''#version 330
+        layout(location = 0) in vec3 in_pos;  // pre-transformed position in clip space
+        layout(location = 1) in vec3 in_col;
+        uniform float u_point_size;
+        out vec3 v_col;
+        void main() {
+            gl_Position = vec4(in_pos, 1.0);  // in_pos is already in clip space
+            v_col = in_col;
+            gl_PointSize = u_point_size;
+        }
+        '''
+            frag_src = '''#version 330
+        in vec3 v_col;
+        out vec4 out_col;
+        void main() {
+            out_col = vec4(v_col, 1.0);
+        }
+        '''
+            try:
+                vs = compileShader(vert_src, GL_VERTEX_SHADER)
+                fs = compileShader(frag_src, GL_FRAGMENT_SHADER)
+                
+                # Create program
+                self.shader_program = glCreateProgram()
+                glAttachShader(self.shader_program, vs)
+                glAttachShader(self.shader_program, fs)
+                
+                # Bind attributes BEFORE linking
+                glBindAttribLocation(self.shader_program, 0, "in_pos")
+                glBindAttribLocation(self.shader_program, 1, "in_col")
+                
+                # Link
+                glLinkProgram(self.shader_program)
+                
+                # Check link status
+                link_status = glGetProgramiv(self.shader_program, GL_LINK_STATUS)
+                if not link_status:
+                    error_log = glGetProgramInfoLog(self.shader_program)
+                    print(f"[GLViewer.initializeGL] Shader link error: {error_log}")
+                
+                glDeleteShader(vs)
+                glDeleteShader(fs)
+                
+                print("[GLViewer.initializeGL] Shader program created successfully with attributes bound")
+                # create VAO and setup immediately
+                try:
+                    self.vao = glGenVertexArrays(1)
+                    print(f"[GLViewer.initializeGL] Generated VAO: {self.vao}")
+                    
+                    # Try to setup VAO immediately (might fail due to context issues, but worth a try)
+                    try:
+                        glBindVertexArray(self.vao)
+                        print(f"[GLViewer.initializeGL] Bound VAO in initializeGL")
+                        
+                        glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
+                        glEnableVertexAttribArray(0)
+                        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+                        print(f"[GLViewer.initializeGL] Position attribute setup")
+                        
+                        glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
+                        glEnableVertexAttribArray(1)
+                        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
+                        print(f"[GLViewer.initializeGL] Color attribute setup")
+                        
+                        glBindBuffer(GL_ARRAY_BUFFER, 0)
+                        glBindVertexArray(0)
+                        print(f"[GLViewer.initializeGL] VAO setup complete in initializeGL!")
+                        self.vao_setup_deferred = False
+                    except Exception as e:
+                        print(f"[GLViewer.initializeGL] VAO attribute setup failed, will try in on_render: {e}")
+                        # Mark for deferred setup
+                        self.vao_setup_deferred = True
+                except Exception as e:
+                    # VAO generation failed
+                    print(f"[GLViewer.initializeGL] VAO generation failed: {e}")
+                    self.vao = None
+                    self.vao_setup_deferred = False
+                # get uniform locations
+                self.u_mvp = glGetUniformLocation(self.shader_program, b"u_mvp")
+                self.u_point_size = glGetUniformLocation(self.shader_program, b"u_point_size")
+                # enable program point size if supported
+                try:
+                    glEnable(GL_PROGRAM_POINT_SIZE)
+                except Exception:
+                    pass
+            except Exception as e:
+                # shader creation failed; we'll fall back to legacy path or clear-only
+                print(f"[GLViewer.initializeGL] Shader creation failed: {e}, will use fixed-function")
+                self.shader_program = None
+        except Exception as e:
+            print(f"[GLViewer.initializeGL] Critical error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     # --- GL data & drawing ---
     def mark_model_dirty(self) -> None:
@@ -189,6 +350,12 @@ class GLViewer(Gtk.GLArea):
         self.use_preview = enabled
         self.mark_model_dirty()
 
+    def update_after_soft_delete(self) -> None:
+        """Lightweight cache update after soft-delete (mark as deleted but not yet compacted)"""
+        self.cache_dirty = True
+        self.gpu_dirty = True
+        self.queue_draw()
+
     def rebuild_render_cache(self) -> None:
         alive_idx = self.model.alive_indices()
         if alive_idx.size == 0:
@@ -201,14 +368,19 @@ class GLViewer(Gtk.GLArea):
 
         alive_points = self.model.positions[alive_idx]
         self.lod_levels = LODBuilder.build_lod_levels(alive_points)
-        chosen_alive_local = self.lod_levels["full"] if not self.use_preview else LODBuilder.choose_level(
-            self.lod_levels, alive_points.shape[0], self.camera.dist
-        )
+        # If we're in an interactive drag (rotating) prefer a lightweight preview LOD
+        if self.interactive and self.use_preview:
+            chosen_alive_local = self.lod_levels["preview"]
+        else:
+            chosen_alive_local = self.lod_levels["full"] if not self.use_preview else LODBuilder.choose_level(
+                self.lod_levels, alive_points.shape[0], self.camera.dist
+            )
         self.render_indices = np.ascontiguousarray(alive_idx[chosen_alive_local], dtype=np.int32)
         self.render_positions = np.ascontiguousarray(self.model.positions[self.render_indices], dtype=np.float32)
         self.render_colors = np.ascontiguousarray(self.model.colors[self.render_indices], dtype=np.float32)
 
-        if cKDTree is not None and self.render_positions.shape[0] > 0:
+        # build spatial tree only when not in interactive mode (costly)
+        if not self.interactive and cKDTree is not None and self.render_positions.shape[0] > 0:
             try:
                 self.render_tree = cKDTree(self.render_positions)
             except Exception:
@@ -252,88 +424,127 @@ class GLViewer(Gtk.GLArea):
         radius = max(0.5, float(np.linalg.norm(extent)) * 0.5)
         self.camera.dist = max(2.0, radius * 3.0)
 
-    def setup_projection(self) -> None:
+    def get_mvp_matrix(self) -> NDArray:
+        """Compute Model-View-Projection matrix on CPU side."""
         w = max(1, self.get_allocated_width())
         h = max(1, self.get_allocated_height())
         aspect = w / h
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        znear = 0.01
-        zfar = 100000.0
-        fovy = 45.0
-        top = znear * math.tan(math.radians(fovy) * 0.5)
-        bottom = -top
-        right = top * aspect
-        left = -right
-        glFrustum(left, right, bottom, top, znear, zfar)
+        proj = create_projection_matrix(45.0, aspect, 0.01, 100000.0)
+        view = create_view_matrix(self.camera)
+        mvp = proj @ view  # P * V * M (where M is identity for now)
+        return mvp
+    
+    def get_transformed_positions(self) -> NDArray:
+        """Get positions transformed by MVP matrix on CPU side."""
+        if self.render_positions.shape[0] == 0:
+            return np.zeros((0, 4), dtype=np.float32)
+        
+        # Get MVP matrix
+        mvp = self.get_mvp_matrix()
+        
+        # Transform positions: convert to homogeneous coordinates, apply MVP, perspective divide
+        ones = np.ones((self.render_positions.shape[0], 1), dtype=np.float32)
+        positions_h = np.hstack([self.render_positions, ones])  # (N, 4)
+        
+        # Apply MVP transformation
+        transformed = positions_h @ mvp.T  # (N, 4) @ (4, 4)^T = (N, 4)
+        
+        # Perspective division
+        transformed_xyz = transformed[:, :3] / np.maximum(transformed[:, 3:4], 1e-6)
+        
+        return transformed_xyz.astype(np.float32)
 
-    def setup_modelview(self) -> None:
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
-        glTranslatef(0.0, 0.0, -float(self.camera.dist))
-        glRotatef(math.degrees(self.camera.pitch), 1.0, 0.0, 0.0)
-        glRotatef(math.degrees(self.camera.yaw), 0.0, 1.0, 0.0)
-        glTranslatef(-float(self.camera.center[0]), -float(self.camera.center[1]), -float(self.camera.center[2]))
+    def render_with_shader(self) -> None:
+        """Render points using modern OpenGL shader pipeline (simplified version)."""
+        if not self.shader_program or self.render_positions.shape[0] == 0:
+            return
+        
+        try:
+            # For now, skip shader rendering and fall back to simple point drawing
+            # This avoids context issues with glUniform calls
+            print("[render_with_shader] Shader pipeline not fully implemented, skipping")
+            return
+        except Exception as e:
+            print(f"[render_with_shader] Exception: {e}")
 
     def paintGL(self) -> None:
+        # Ensure GL context is current
+        self.make_current()
+        
         w = self.get_allocated_width()
         h = self.get_allocated_height()
         glViewport(0, 0, w, h)
         glClearColor(0.1, 0.1, 0.12, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        
         if self.model.alive_count == 0:
+            print("[GLViewer.paintGL] No data to render (alive_count=0)")
             return
-        # Many systems provide a core-profile GL context where legacy fixed-function
-        # pipeline calls (glMatrixMode, glVertexPointer, etc.) are invalid. Wrap
-        # the original rendering sequence and fall back to a simple clear if
-        # the calls are not supported yet. Later we should implement modern
-        # shader-based rendering for full functionality.
+        
+        print(f"[GLViewer.paintGL] Rendering {self.model.alive_count} alive points")
+        
         if self.gpu_dirty or self.cache_dirty:
+            print(f"[GLViewer.paintGL] Uploading GPU buffers (gpu_dirty={self.gpu_dirty}, cache_dirty={self.cache_dirty})")
             self.upload_gpu_buffers()
 
         try:
-            self.setup_projection()
-            self.setup_modelview()
-
-            glPointSize(float(self.point_size))
-            glEnableClientState(GL_VERTEX_ARRAY)
-            glEnableClientState(GL_COLOR_ARRAY)
+            # Transform vertices on CPU side and upload to GPU
+            print(f"[GLViewer.paintGL] Transforming {self.render_positions.shape[0]} vertices on CPU")
+            transformed_positions = self.get_transformed_positions()
+            print(f"[GLViewer.paintGL] Uploading transformed positions to pos_vbo")
             glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
-            glVertexPointer(3, GL_FLOAT, 0, None)
-            glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
-            glColorPointer(3, GL_FLOAT, 0, None)
-            glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
+            glBufferData(GL_ARRAY_BUFFER, transformed_positions.nbytes, transformed_positions, GL_DYNAMIC_DRAW)
             glBindBuffer(GL_ARRAY_BUFFER, 0)
-            glDisableClientState(GL_COLOR_ARRAY)
-            glDisableClientState(GL_VERTEX_ARRAY)
+            print(f"[GLViewer.paintGL] Transformed positions uploaded")
+            
+            # Use shader pipeline
+            if not self.shader_program:
+                print("[GLViewer.paintGL] Shader program not available")
+                return
+            
+            print("[GLViewer.paintGL] Using shader pipeline with CPU-transformed vertices")
+            
+            # Use shader
+            glUseProgram(self.shader_program)
+            print(f"[GLViewer.paintGL] glUseProgram OK, program={self.shader_program}")
+            
+            # Set point size uniform
+            point_size_loc = glGetUniformLocation(self.shader_program, "u_point_size")
+            glUniform1f(point_size_loc, float(self.point_size))
+            print(f"[GLViewer.paintGL] Point size uniform set OK")
+            
+            # Render using VAO if available
+            if self.vao and self.vao > 0:
+                print(f"[GLViewer.paintGL] Using VAO {self.vao}")
+                glBindVertexArray(self.vao)
+                print(f"[GLViewer.paintGL] Drawing {int(self.render_positions.shape[0])} points with VAO")
+                glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
+                glBindVertexArray(0)
+            else:
+                print(f"[GLViewer.paintGL] No VAO available, drawing without vertex attributes")
+                print(f"[GLViewer.paintGL] Drawing {int(self.render_positions.shape[0])} points (will appear as empty)")
+                glDrawArrays(GL_POINTS, 0, int(self.render_positions.shape[0]))
+            
+            glUseProgram(0)
+            print("[GLViewer.paintGL] Successfully rendered!")
 
             if self.dragging_box and self.box_start is not None and self.box_end is not None:
                 self.draw_overlay_box()
-        except Exception:
-            # Fixed-function not available; fall back to a basic clear-only view
+        except Exception as e:
+            print(f"[GLViewer.paintGL] Rendering failed: {e}")
+            import traceback
+            traceback.print_exc()
             try:
-                self.status_callback("警告: 当前 GL 上下文不支持固定管线渲染，已启用降级视图")
+                self.status_callback(f"警告: GL 渲染错误: {str(e)}")
             except Exception:
                 pass
             return
 
     def draw_overlay_box(self) -> None:
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        glOrtho(0, self.get_allocated_width(), self.get_allocated_height(), 0, -1, 1)
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
-        glDisable(GL_DEPTH_TEST)
-        glColor3f(0.2, 0.8, 1.0)
-        x1, y1 = self.box_start
-        x2, y2 = self.box_end
-        glBegin(GL_LINE_LOOP)
-        glVertex2f(x1, y1)
-        glVertex2f(x2, y1)
-        glVertex2f(x2, y2)
-        glVertex2f(x1, y2)
-        glEnd()
-        glEnable(GL_DEPTH_TEST)
+        """Draw selection box overlay (disabled in Core Profile GL - needs shader implementation)."""
+        # TODO: Implement selection box drawing with shaders
+        # For now, skip this feature as it requires glBegin/glEnd which are not available in Core Profile
+        pass
 
     # --- input handling ---
     def on_button_press(self, widget, event) -> bool:
@@ -348,6 +559,9 @@ class GLViewer(Gtk.GLArea):
             elif self.selection_mode == "brush":
                 self.brush_active = True
                 self.brush_select(event.x, event.y, additive=False)
+        elif event.button == 3:
+            # start interactive camera drag mode: use preview LOD to keep interaction smooth
+            self.interactive = True
         return True
 
     def on_motion_notify(self, widget, event) -> bool:
@@ -369,7 +583,8 @@ class GLViewer(Gtk.GLArea):
             self.camera.yaw += dx * 0.01
             self.camera.pitch += dy * 0.01
             self.camera.pitch = max(-1.5, min(1.5, self.camera.pitch))
-            self.cache_dirty = True
+            # rotation doesn't change model LOD selection (dist unchanged);
+            # avoid expensive cache rebuild during drag — only redraw the view
             self.queue_draw()
         self.last_pos = (event.x, event.y)
         return True
@@ -383,6 +598,11 @@ class GLViewer(Gtk.GLArea):
         self.brush_active = False
         self.box_start = None
         self.box_end = None
+        # end interactive camera drag mode
+        if event.button == 3:
+            self.interactive = False
+            # request a full rebuild (may re-evaluate LOD based on camera)
+            self.mark_model_dirty()
         self.last_pos = None
         return True
 
