@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk
+from gi.repository import Gtk, Pango
 
 from app.history import HistoryStack
 from app.io_utils import PointCloudIO
@@ -12,6 +12,8 @@ from app.gtk_viewer import GLViewer
 
 
 class Editor(Gtk.Window):
+    SIDE_PANEL_WIDTH = 260
+
     def __init__(self) -> None:
         super().__init__()
         self.set_title("Point Cloud Editor (GTK3 + ModernGL)")
@@ -24,8 +26,11 @@ class Editor(Gtk.Window):
         self.viewer = GLViewer(self.model, self.set_status)
 
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        side.set_size_request(self.SIDE_PANEL_WIDTH, -1)
+        side.set_hexpand(False)
         title = Gtk.Label(label="点云编辑查看器")
         title.set_markup("<span size='14000'><b>点云编辑查看器</b></span>")
+        title.set_xalign(0)
 
         load_btn = Gtk.Button(label="导入")
         save_ascii_btn = Gtk.Button(label="导出 ASCII PLY/XYZ")
@@ -74,6 +79,18 @@ class Editor(Gtk.Window):
 
         self.status = Gtk.Label(label="就绪")
         self.status.set_line_wrap(True)
+        self.status.set_line_wrap_mode(Pango.WrapMode.CHAR)
+        self.status.set_max_width_chars(24)
+        self.status.set_xalign(0)
+        self.status.set_selectable(True)
+
+        help_label = Gtk.Label(
+            label="操作说明：\n左键按当前模式选择\n右键拖拽旋转\n滚轮缩放\n删除默认只打标记，点击提交删除再压缩数组"
+        )
+        help_label.set_line_wrap(True)
+        help_label.set_line_wrap_mode(Pango.WrapMode.CHAR)
+        help_label.set_max_width_chars(24)
+        help_label.set_xalign(0)
 
         side.pack_start(title, False, False, 0)
         for btn in (load_btn, save_ascii_btn, save_bin_btn, demo_btn, mark_delete_btn, commit_delete_btn, undo_btn, redo_btn, clear_sel_btn, reset_btn):
@@ -93,7 +110,7 @@ class Editor(Gtk.Window):
         side.pack_start(self.move_z, False, False, 0)
         side.pack_start(move_btn, False, False, 0)
         side.pack_start(Gtk.Box(), True, True, 0)  # spacer
-        side.pack_start(Gtk.Label(label="操作说明：\n左键按当前模式选择\n右键拖拽旋转\n滚轮缩放\n删除默认只打标记，点击提交删除再压缩数组"), False, False, 0)
+        side.pack_start(help_label, False, False, 0)
         side.pack_start(self.status, False, False, 0)
 
         root.pack_start(side, False, False, 6)
@@ -134,15 +151,19 @@ class Editor(Gtk.Window):
             pos, col = PointCloudIO.load(path)
             if pos.shape[0] == 0:
                 raise ValueError("点云为空")
-            self.model.set_data(pos, col, path)
+            self.model.set_data(pos, col, path, validated=True)
             self.viewer.camera.yaw = 0.0
             self.viewer.camera.pitch = 0.0
             self.viewer.fit_camera_to_model()
             self.viewer.mark_model_dirty()
             mn, mx = self.model.bounds()
             self.set_status(
-                f"已导入: {path.split('/')[-1]}，原始点数: {self.model.count}，存活点数: {self.model.alive_count}，范围: "
-                f"x[{mn[0]:.3f},{mx[0]:.3f}] y[{mn[1]:.3f},{mx[1]:.3f}] z[{mn[2]:.3f},{mx[2]:.3f}]"
+                f"已导入: {path.split('/')[-1]}\n"
+                f"原始点数: {self.model.count}\n"
+                f"存活点数: {self.model.alive_count}\n"
+                f"范围: x[{mn[0]:.3f},{mx[0]:.3f}] "
+                f"y[{mn[1]:.3f},{mx[1]:.3f}] "
+                f"z[{mn[2]:.3f},{mx[2]:.3f}]"
             )
         except Exception as e:
             dlg = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text="导入失败")
@@ -210,7 +231,7 @@ class Editor(Gtk.Window):
         pos = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(np.float32)
         col = np.ones_like(pos, dtype=np.float32) * np.array([0.2, 0.8, 1.0], dtype=np.float32)
         print(f"[Editor.demo] Setting data: {pos.shape[0]} points")
-        self.model.set_data(pos, col)
+        self.model.set_data(pos, col, validated=True)
         print(f"[Editor.demo] Model alive_count: {self.model.alive_count}")
         self.viewer.fit_camera_to_model()
         print(f"[Editor.demo] Camera: center={self.viewer.camera.center}, dist={self.viewer.camera.dist}")
@@ -260,7 +281,7 @@ class Editor(Gtk.Window):
                 "indices": indices.copy(),
                 "delta": np.array([dx, dy, dz], dtype=np.float32),
             })
-            self.viewer.mark_model_dirty()
+            self.viewer.update_moved_points(indices)
         self.set_status(f"已移动点数: {moved}")
 
     def reset_view(self) -> None:

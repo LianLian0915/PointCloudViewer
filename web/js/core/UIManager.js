@@ -55,10 +55,17 @@ export class UIManager {
     }
 
     setStats(html) {
+        this.statsEl.style.color = '';
         this.statsEl.innerHTML = html;
     }
 
+    setError(message) {
+        this.statsEl.style.color = '#ff8d8d';
+        this.statsEl.textContent = message;
+    }
+
     setDefaultStats() {
+        this.statsEl.style.color = '';
         this.statsEl.textContent = '尚未加载点云';
     }
 

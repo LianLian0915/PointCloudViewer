@@ -115,6 +115,7 @@ class GLViewer(Gtk.GLArea):
         self.model = model
         self.status_callback = status_callback
         self.camera = Camera()
+        self.scene_radius = 1.0
         self.point_size = 3.0
         self.last_pos = None
         self.interactive = False  # when True, use lightweight LOD for smooth interaction
@@ -127,6 +128,7 @@ class GLViewer(Gtk.GLArea):
         }
         self.render_indices = np.zeros((0,), dtype=np.int32)
         self.render_positions = np.zeros((0, 3), dtype=np.float32)
+        self.render_gpu_positions = np.zeros((0, 3), dtype=np.float32)
         self.render_colors = np.zeros((0, 3), dtype=np.float32)
         self.render_tree = None
         self.use_preview = True
@@ -258,10 +260,11 @@ class GLViewer(Gtk.GLArea):
             vert_src = '''#version 330
         layout(location = 0) in vec3 in_pos;  // pre-transformed position in clip space
         layout(location = 1) in vec3 in_col;
+        uniform mat4 u_mvp;
         uniform float u_point_size;
         out vec3 v_col;
         void main() {
-            gl_Position = vec4(in_pos, 1.0);  // in_pos is already in clip space
+            gl_Position = u_mvp * vec4(in_pos, 1.0);
             v_col = in_col;
             gl_PointSize = u_point_size;
         }
@@ -326,6 +329,23 @@ class GLViewer(Gtk.GLArea):
         self.gpu_dirty = True
         self.queue_draw()
 
+    def update_moved_points(self, indices: np.ndarray) -> None:
+        if indices.size == 0:
+            return
+        if self.cache_dirty or self.render_indices.size == 0:
+            self.mark_model_dirty()
+            return
+        moved_visible = np.isin(self.render_indices, indices)
+        if not np.any(moved_visible):
+            self.queue_draw()
+            return
+        self.render_positions[moved_visible] = self.model.positions[self.render_indices[moved_visible]]
+        self.render_gpu_positions[moved_visible] = (
+            self.render_positions[moved_visible] - self.camera.center[None, :]
+        )
+        self.gpu_dirty = True
+        self.queue_draw()
+
     def set_selection_mode(self, mode: str) -> None:
         self.selection_mode = mode
 
@@ -340,27 +360,41 @@ class GLViewer(Gtk.GLArea):
         self.queue_draw()
 
     def rebuild_render_cache(self) -> None:
-        alive_idx = self.model.alive_indices()
-        if alive_idx.size == 0:
+        alive_count = self.model.alive_count
+        if alive_count == 0:
             self.render_indices = np.zeros((0,), dtype=np.int32)
             self.render_positions = np.zeros((0, 3), dtype=np.float32)
+            self.render_gpu_positions = np.zeros((0, 3), dtype=np.float32)
             self.render_colors = np.zeros((0, 3), dtype=np.float32)
             self.render_tree = None
             self.cache_dirty = False
             return
 
-        alive_points = self.model.positions[alive_idx]
-        self.lod_levels = LODBuilder.build_lod_levels(alive_points)
+        self.lod_levels = LODBuilder.build_lod_levels_for_count(alive_count)
         # If we're in an interactive drag (rotating) prefer a lightweight preview LOD
         if self.interactive and self.use_preview:
             chosen_alive_local = self.lod_levels["preview"]
         else:
             chosen_alive_local = self.lod_levels["full"] if not self.use_preview else LODBuilder.choose_level(
-                self.lod_levels, alive_points.shape[0], self.camera.dist
+                self.lod_levels, alive_count, self.camera.dist
             )
-        self.render_indices = np.ascontiguousarray(alive_idx[chosen_alive_local], dtype=np.int32)
-        self.render_positions = np.ascontiguousarray(self.model.positions[self.render_indices], dtype=np.float32)
-        self.render_colors = np.ascontiguousarray(self.model.colors[self.render_indices], dtype=np.float32)
+        if self.model.deleted_mask.size and np.any(self.model.deleted_mask):
+            alive_idx = self.model.alive_indices()
+            self.render_indices = np.ascontiguousarray(alive_idx[chosen_alive_local], dtype=np.int32)
+            self.render_positions = np.ascontiguousarray(self.model.positions[self.render_indices], dtype=np.float32)
+            self.render_colors = np.ascontiguousarray(self.model.colors[self.render_indices], dtype=np.float32)
+        else:
+            self.render_indices = np.ascontiguousarray(chosen_alive_local, dtype=np.int32)
+            if self.render_indices.size == self.model.count:
+                self.render_positions = self.model.positions
+                self.render_colors = self.model.colors
+            else:
+                self.render_positions = np.ascontiguousarray(self.model.positions[self.render_indices], dtype=np.float32)
+                self.render_colors = np.ascontiguousarray(self.model.colors[self.render_indices], dtype=np.float32)
+        self.render_gpu_positions = np.ascontiguousarray(
+            self.render_positions - self.camera.center[None, :],
+            dtype=np.float32,
+        )
 
         # build spatial tree only when not in interactive mode (costly)
         if not self.interactive and cKDTree is not None and self.render_positions.shape[0] > 0:
@@ -384,7 +418,7 @@ class GLViewer(Gtk.GLArea):
         colors = np.ascontiguousarray(colors, dtype=np.float32)
 
         glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
-        glBufferData(GL_ARRAY_BUFFER, self.render_positions.nbytes, self.render_positions, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, self.render_gpu_positions.nbytes, self.render_gpu_positions, GL_STATIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, self.col_vbo)
         glBufferData(GL_ARRAY_BUFFER, colors.nbytes, colors, GL_DYNAMIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
@@ -392,21 +426,32 @@ class GLViewer(Gtk.GLArea):
         try:
             if self.mgl_ctx is not None and self.mgl_pos_vbo is not None and self.mgl_prog is not None:
                 # ensure contiguous float32
-                pos_bytes = np.ascontiguousarray(self.render_positions, dtype=np.float32).tobytes()
+                pos_bytes = np.ascontiguousarray(self.render_gpu_positions, dtype=np.float32).tobytes()
                 col_bytes = np.ascontiguousarray(colors, dtype=np.float32).tobytes()
                 # Recreate or write depending on buffer size
                 try:
-                    self.mgl_pos_vbo.orphan(len(pos_bytes))
+                    if getattr(self.mgl_pos_vbo, "size", len(pos_bytes)) != len(pos_bytes):
+                        self.mgl_pos_vbo.release()
+                        self.mgl_pos_vbo = self.mgl_ctx.buffer(pos_bytes)
+                        self.mgl_vao = None
+                    else:
+                        self.mgl_pos_vbo.orphan(len(pos_bytes))
                 except Exception:
                     pass
                 try:
-                    self.mgl_col_vbo.orphan(len(col_bytes))
+                    if getattr(self.mgl_col_vbo, "size", len(col_bytes)) != len(col_bytes):
+                        self.mgl_col_vbo.release()
+                        self.mgl_col_vbo = self.mgl_ctx.buffer(col_bytes)
+                        self.mgl_vao = None
+                    else:
+                        self.mgl_col_vbo.orphan(len(col_bytes))
                 except Exception:
                     pass
                 try:
-                    self.mgl_pos_vbo.write(pos_bytes)
-                    self.mgl_col_vbo.write(col_bytes)
-                    print(f"[GLViewer.upload_gpu_buffers] ModernGL buffers updated: pos={len(pos_bytes)} bytes, col={len(col_bytes)} bytes")
+                    if getattr(self.mgl_pos_vbo, "size", len(pos_bytes)) == len(pos_bytes):
+                        self.mgl_pos_vbo.write(pos_bytes)
+                    if getattr(self.mgl_col_vbo, "size", len(col_bytes)) == len(col_bytes):
+                        self.mgl_col_vbo.write(col_bytes)
                 except Exception as e:
                     print(f"[GLViewer.upload_gpu_buffers] ModernGL buffer write failed: {e}")
                 
@@ -440,6 +485,7 @@ class GLViewer(Gtk.GLArea):
         self.camera.center = ((mn + mx) * 0.5).astype(np.float32)
         extent = (mx - mn).astype(np.float32)
         radius = max(0.5, float(np.linalg.norm(extent)) * 0.5)
+        self.scene_radius = radius
         self.camera.dist = max(2.0, radius * 3.0)
 
     def get_mvp_matrix(self) -> NDArray:
@@ -447,8 +493,16 @@ class GLViewer(Gtk.GLArea):
         w = max(1, self.get_allocated_width())
         h = max(1, self.get_allocated_height())
         aspect = w / h
-        proj = create_projection_matrix(45.0, aspect, 0.01, 100000.0)
-        view = create_view_matrix(self.camera)
+        znear = max(0.001, min(self.scene_radius / 1000.0, self.camera.dist * 0.1))
+        zfar = max(1000.0, self.camera.dist + self.scene_radius * 4.0)
+        proj = create_projection_matrix(45.0, aspect, znear, zfar)
+        camera = Camera(
+            yaw=self.camera.yaw,
+            pitch=self.camera.pitch,
+            dist=self.camera.dist,
+            center=np.zeros((3,), dtype=np.float32),
+        )
+        view = create_view_matrix(camera)
         mvp = proj @ view  # P * V * M (where M is identity for now)
         return mvp
     
@@ -486,7 +540,6 @@ class GLViewer(Gtk.GLArea):
             print(f"[render_with_shader] Exception: {e}")
 
     def paintGL(self) -> None:
-        # Ensure GL context is current
         self.make_current()
         
         w = self.get_allocated_width()
@@ -496,57 +549,24 @@ class GLViewer(Gtk.GLArea):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         
         if self.model.alive_count == 0:
-            print("[GLViewer.paintGL] No data to render (alive_count=0)")
             return
-        
-        print(f"[GLViewer.paintGL] Rendering {self.model.alive_count} alive points")
-        
+
         if self.gpu_dirty or self.cache_dirty:
-            print(f"[GLViewer.paintGL] Uploading GPU buffers (gpu_dirty={self.gpu_dirty}, cache_dirty={self.cache_dirty})")
             self.upload_gpu_buffers()
 
         try:
-            # Transform vertices on CPU side
-            print(f"[GLViewer.paintGL] Transforming {self.render_positions.shape[0]} vertices on CPU")
-            transformed_positions = self.get_transformed_positions()
-
-            # Upload transformed positions to PyOpenGL VBO (fallback)
-            try:
-                print(f"[GLViewer.paintGL] Uploading transformed positions to pos_vbo")
-                glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
-                glBufferData(GL_ARRAY_BUFFER, transformed_positions.nbytes, transformed_positions, GL_DYNAMIC_DRAW)
-                glBindBuffer(GL_ARRAY_BUFFER, 0)
-                print(f"[GLViewer.paintGL] Transformed positions uploaded (GL)")
-            except Exception:
-                pass
-
-            # If ModernGL is available, write transformed positions into its buffer and render via VAO
             if self.mgl_ctx is not None and self.mgl_vao is not None:
                 try:
-                    pos_bytes = np.ascontiguousarray(transformed_positions, dtype=np.float32).tobytes()
-                    col_bytes = np.ascontiguousarray(self.render_colors, dtype=np.float32).tobytes()
-                    try:
-                        self.mgl_pos_vbo.orphan(len(pos_bytes))
-                    except Exception:
-                        pass
-                    try:
-                        self.mgl_col_vbo.orphan(len(col_bytes))
-                    except Exception:
-                        pass
-                    self.mgl_pos_vbo.write(pos_bytes)
-                    self.mgl_col_vbo.write(col_bytes)
-
-                    # set point size uniform if present
+                    mvp = self.get_mvp_matrix()
+                    if 'u_mvp' in self.mgl_prog:
+                        self.mgl_prog['u_mvp'].write(np.ascontiguousarray(mvp.T, dtype=np.float32).tobytes())
                     try:
                         if 'u_point_size' in self.mgl_prog:
                             self.mgl_prog['u_point_size'].value = float(self.point_size)
                     except Exception:
                         pass
 
-                    # Render using ModernGL VAO
-                    print(f"[GLViewer.paintGL] ModernGL rendering {int(self.render_positions.shape[0])} points")
                     self.mgl_vao.render(mode=moderngl.POINTS)
-                    print("[GLViewer.paintGL] ModernGL render complete")
                     return
                 except Exception as e:
                     print(f"[GLViewer.paintGL] ModernGL render failed: {e}")
@@ -555,7 +575,6 @@ class GLViewer(Gtk.GLArea):
 
             # Fallback: attempt to use existing PyOpenGL shader path
             if not self.shader_program:
-                print("[GLViewer.paintGL] Shader program not available (fallback)")
                 return
             
             print("[GLViewer.paintGL] Using PyOpenGL shader fallback")
@@ -606,6 +625,9 @@ class GLViewer(Gtk.GLArea):
         elif event.button == 3:
             # start interactive camera drag mode: use preview LOD to keep interaction smooth
             self.interactive = True
+            if self.use_preview and self.model.alive_count > 150_000:
+                self.cache_dirty = True
+                self.gpu_dirty = True
         return True
 
     def on_motion_notify(self, widget, event) -> bool:
@@ -651,15 +673,25 @@ class GLViewer(Gtk.GLArea):
         return True
 
     def on_scroll(self, widget, event) -> bool:
-        # event.delta_y may be present, but use event.direction for discrete scroll
-        if hasattr(event, "delta_y"):
-            delta = event.delta_y
-        else:
-            # fallback: use event.direction
-            delta = -1.0 if event.direction == Gdk.ScrollDirection.UP else 1.0
-        self.camera.dist += -delta * 0.2
-        self.camera.dist = max(0.2, min(100000.0, self.camera.dist))
-        self.cache_dirty = True
+        delta = 0.0
+        try:
+            ok, _, dy = event.get_scroll_deltas()
+            if ok:
+                delta = float(dy)
+        except Exception:
+            pass
+        if delta == 0.0:
+            if event.direction == Gdk.ScrollDirection.UP:
+                delta = -1.0
+            elif event.direction == Gdk.ScrollDirection.DOWN:
+                delta = 1.0
+        if delta == 0.0:
+            return True
+
+        self.camera.dist *= float(1.15 ** delta)
+        min_dist = max(0.001, self.scene_radius / 1000.0)
+        max_dist = max(100000.0, self.scene_radius * 50.0)
+        self.camera.dist = max(min_dist, min(max_dist, self.camera.dist))
         self.queue_draw()
         return True
 

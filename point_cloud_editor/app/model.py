@@ -34,14 +34,18 @@ class PointCloudModel:
         self.deleted_mask = np.ascontiguousarray(deleted_mask, dtype=bool)
         self.selected = np.zeros((self.positions.shape[0],), dtype=bool)
 
-    def set_data(self, pos: np.ndarray, col: np.ndarray, path: str = "") -> None:
+    def set_data(self, pos: np.ndarray, col: np.ndarray, path: str = "", validated: bool = False) -> None:
         pos = np.asarray(pos, dtype=np.float32).reshape(-1, 3)
         col = np.asarray(col, dtype=np.float32).reshape(-1, 3)
         if pos.shape[0] != col.shape[0]:
             raise ValueError("positions 和 colors 数量不一致")
-        valid = np.isfinite(pos).all(axis=1)
-        self.positions = np.ascontiguousarray(pos[valid], dtype=np.float32)
-        self.colors = np.ascontiguousarray(np.clip(col[valid], 0.0, 1.0), dtype=np.float32)
+        if validated:
+            self.positions = np.ascontiguousarray(pos, dtype=np.float32)
+            self.colors = np.ascontiguousarray(col, dtype=np.float32)
+        else:
+            valid = np.isfinite(pos).all(axis=1)
+            self.positions = np.ascontiguousarray(pos[valid], dtype=np.float32)
+            self.colors = np.ascontiguousarray(np.clip(col[valid], 0.0, 1.0), dtype=np.float32)
         self.selected = np.zeros((self.positions.shape[0],), dtype=bool)
         self.deleted_mask = np.zeros((self.positions.shape[0],), dtype=bool)
         self.current_path = path
@@ -86,29 +90,68 @@ class PointCloudModel:
             self.selected[valid] = True
         return int(valid.size)
 
-    def mark_selected_deleted(self) -> int:
+    def mark_selected_deleted(self) -> tuple[int, np.ndarray]:
         mask = self.selected & ~self.deleted_mask
         removed = int(np.count_nonzero(mask))
+        indices = np.where(mask)[0].astype(np.int32)
         if removed > 0:
             self.deleted_mask[mask] = True
             self.selected[:] = False
-        return removed
+        return removed, indices
 
-    def move_selected(self, dx: float, dy: float, dz: float) -> int:
+    def move_selected(self, dx: float, dy: float, dz: float) -> tuple[int, np.ndarray]:
         mask = self.selected & ~self.deleted_mask
         moved = int(np.count_nonzero(mask))
+        indices = np.where(mask)[0].astype(np.int32)
         if moved > 0:
             self.positions[mask] += np.array([dx, dy, dz], dtype=np.float32)
-            self.positions = np.ascontiguousarray(self.positions, dtype=np.float32)
-        return moved
+        return moved, indices
 
-    def compact_deleted(self) -> int:
+    def compact_deleted(self) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
         if self.count == 0:
-            return 0
+            return 0, self.positions.copy(), self.colors.copy(), self.deleted_mask.copy()
         keep = ~self.deleted_mask
         removed = int(np.count_nonzero(self.deleted_mask))
+        old_pos = self.positions.copy()
+        old_col = self.colors.copy()
+        old_deleted = self.deleted_mask.copy()
         self.positions = np.ascontiguousarray(self.positions[keep], dtype=np.float32)
         self.colors = np.ascontiguousarray(self.colors[keep], dtype=np.float32)
         self.selected = np.zeros((self.positions.shape[0],), dtype=bool)
         self.deleted_mask = np.zeros((self.positions.shape[0],), dtype=bool)
-        return removed
+        return removed, old_pos, old_col, old_deleted
+
+    def apply_inverse_command(self, cmd: dict) -> dict | None:
+        typ = cmd.get("type")
+        if typ == "move":
+            indices = np.asarray(cmd.get("indices", []), dtype=np.int64)
+            delta = np.asarray(cmd.get("delta", [0.0, 0.0, 0.0]), dtype=np.float32)
+            valid = indices[(indices >= 0) & (indices < self.count)]
+            if valid.size:
+                self.positions[valid] -= delta
+            return {"type": "move", "indices": valid.astype(np.int32), "delta": -delta}
+        if typ == "mark_delete":
+            indices = np.asarray(cmd.get("indices", []), dtype=np.int64)
+            valid = indices[(indices >= 0) & (indices < self.count)]
+            if valid.size:
+                self.deleted_mask[valid] = False
+            return {"type": "unmark_delete", "indices": valid.astype(np.int32)}
+        if typ == "unmark_delete":
+            indices = np.asarray(cmd.get("indices", []), dtype=np.int64)
+            valid = indices[(indices >= 0) & (indices < self.count)]
+            if valid.size:
+                self.deleted_mask[valid] = True
+                self.selected[valid] = False
+            return {"type": "mark_delete", "indices": valid.astype(np.int32)}
+        if typ == "restore_state":
+            old_pos = self.positions.copy()
+            old_col = self.colors.copy()
+            old_deleted = self.deleted_mask.copy()
+            self.restore_state(cmd["positions"], cmd["colors"], cmd["deleted_mask"])
+            return {
+                "type": "restore_state",
+                "positions": old_pos,
+                "colors": old_col,
+                "deleted_mask": old_deleted,
+            }
+        return None

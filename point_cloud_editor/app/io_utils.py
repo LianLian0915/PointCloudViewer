@@ -2,36 +2,68 @@ from __future__ import annotations
 
 from pathlib import Path
 import numpy as np
-from plyfile import PlyData, PlyElement
+
+try:
+    from plyfile import PlyData, PlyElement
+except Exception:
+    PlyData = None
+    PlyElement = None
 
 
 class PointCloudIO:
     @staticmethod
     def load_xyz(path: str) -> tuple[np.ndarray, np.ndarray]:
-        pts, cols = [], []
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                vals = line.split()
-                if len(vals) < 3:
-                    continue
-                x, y, z = map(float, vals[:3])
-                pts.append([x, y, z])
-                if len(vals) >= 6:
-                    r, g, b = map(float, vals[3:6])
-                    if max(r, g, b) > 1.0:
-                        r /= 255.0
-                        g /= 255.0
-                        b /= 255.0
-                    cols.append([r, g, b])
-                else:
-                    cols.append([0.2, 0.8, 1.0])
-        if not pts:
+        try:
+            data = np.loadtxt(path, dtype=np.float32, comments=("#", "//"))
+        except Exception:
+            pts, cols = [], []
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    vals = line.split()
+                    if len(vals) < 3:
+                        continue
+                    x, y, z = map(float, vals[:3])
+                    pts.append([x, y, z])
+                    if len(vals) >= 6:
+                        r, g, b = map(float, vals[3:6])
+                        if max(r, g, b) > 1.0:
+                            r /= 255.0
+                            g /= 255.0
+                            b /= 255.0
+                        cols.append([r, g, b])
+                    else:
+                        cols.append([0.2, 0.8, 1.0])
+            if not pts:
+                return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+            return np.asarray(pts, dtype=np.float32), np.asarray(cols, dtype=np.float32)
+
+        if data.size == 0:
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
-        return np.asarray(pts, dtype=np.float32), np.asarray(cols, dtype=np.float32)
+        data = np.atleast_2d(data)
+        if data.shape[1] < 3:
+            raise ValueError("XYZ/TXT 至少需要 x y z 三列")
+        pos = np.ascontiguousarray(data[:, :3], dtype=np.float32)
+        valid = np.isfinite(pos).all(axis=1)
+        pos = pos[valid] if not np.all(valid) else pos
+        if data.shape[1] >= 6:
+            col = np.ascontiguousarray(data[:, 3:6], dtype=np.float32)
+            col = col[valid] if col.shape[0] == valid.shape[0] and not np.all(valid) else col
+            if col.size and float(np.nanmax(col)) > 1.0:
+                col *= 1.0 / 255.0
+            col = np.clip(col, 0.0, 1.0)
+        else:
+            col = np.empty_like(pos, dtype=np.float32)
+            col[:] = np.array([0.2, 0.8, 1.0], dtype=np.float32)
+        return np.ascontiguousarray(pos, dtype=np.float32), np.ascontiguousarray(col, dtype=np.float32)
 
     @staticmethod
     def load_ply(path: str) -> tuple[np.ndarray, np.ndarray]:
-        ply = PlyData.read(path)
+        if PlyData is None:
+            raise RuntimeError("读取 PLY 需要安装 plyfile: pip install plyfile")
+        try:
+            ply = PlyData.read(path, mmap=True)
+        except TypeError:
+            ply = PlyData.read(path)
         if "vertex" not in ply:
             raise ValueError("PLY 文件中没有 vertex")
         vertex = ply["vertex"]
@@ -39,25 +71,26 @@ class PointCloudIO:
         if not {"x", "y", "z"}.issubset(names):
             raise ValueError("PLY 顶点缺少 x/y/z 字段")
 
-        pos = np.column_stack([
-            np.asarray(vertex["x"], dtype=np.float32),
-            np.asarray(vertex["y"], dtype=np.float32),
-            np.asarray(vertex["z"], dtype=np.float32),
-        ])
+        pos = np.empty((vertex.count, 3), dtype=np.float32)
+        pos[:, 0] = vertex["x"]
+        pos[:, 1] = vertex["y"]
+        pos[:, 2] = vertex["z"]
         valid = np.isfinite(pos).all(axis=1)
-        pos = pos[valid]
+        if not np.all(valid):
+            pos = pos[valid]
 
         if {"red", "green", "blue"}.issubset(names):
-            col = np.column_stack([
-                np.asarray(vertex["red"], dtype=np.float32),
-                np.asarray(vertex["green"], dtype=np.float32),
-                np.asarray(vertex["blue"], dtype=np.float32),
-            ])
-            col = col[valid]
+            col = np.empty((vertex.count, 3), dtype=np.float32)
+            col[:, 0] = vertex["red"]
+            col[:, 1] = vertex["green"]
+            col[:, 2] = vertex["blue"]
+            if not np.all(valid):
+                col = col[valid]
             if col.size and float(col.max()) > 1.0:
-                col /= 255.0
+                col *= 1.0 / 255.0
         else:
-            col = np.ones_like(pos, dtype=np.float32) * np.array([0.2, 0.8, 1.0], dtype=np.float32)
+            col = np.empty_like(pos, dtype=np.float32)
+            col[:] = np.array([0.2, 0.8, 1.0], dtype=np.float32)
 
         return np.ascontiguousarray(pos, dtype=np.float32), np.ascontiguousarray(np.clip(col, 0.0, 1.0), dtype=np.float32)
 
@@ -83,6 +116,8 @@ class PointCloudIO:
 
     @staticmethod
     def save_ply_binary(path: str, positions: np.ndarray, colors: np.ndarray) -> None:
+        if PlyData is None or PlyElement is None:
+            raise RuntimeError("导出 Binary PLY 需要安装 plyfile: pip install plyfile")
         rgb = np.clip(np.round(colors * 255.0), 0, 255).astype(np.uint8)
         vertex = np.empty(
             positions.shape[0],

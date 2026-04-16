@@ -91,6 +91,16 @@ export class PointCloudManager {
         }
     }
 
+    escapeHTML(value) {
+        return String(value).replace(/[&<>"']/g, (char) => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        })[char]);
+    }
+
     async loadPLY(file, pointSize = 0.01) {
         const t0 = performance.now();
 
@@ -166,7 +176,7 @@ export class PointCloudManager {
             : '';
 
         return `
-文件：${fileName}<br />
+文件：${this.escapeHTML(fileName)}<br />
 点数：${count.toLocaleString()}<br />
 包围盒尺寸：${size.x.toFixed(4)} × ${size.y.toFixed(4)} × ${size.z.toFixed(4)}<br />
 包围球半径：${sphere.radius.toFixed(4)}<br />

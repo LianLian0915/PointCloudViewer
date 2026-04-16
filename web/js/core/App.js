@@ -33,7 +33,7 @@ export class App {
                 this.ui.setStats(this.pointCloudManager.getStats(this.currentFileName));
             } catch (error) {
                 console.error('加载 PLY 失败:', error);
-                this.ui.setStats(`<span style="color:#ff8d8d">加载失败：${error.message}</span>`);
+                this.ui.setError(`加载失败：${error.message}`);
             } finally {
                 this.ui.setLoading(false);
             }
