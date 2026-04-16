@@ -1,0 +1,14 @@
+# Core runtime dependencies for the GTK + ModernGL point cloud editor.
+#
+# GTK bindings are provided by the system package python3-gi on most Linux
+# distributions. See README.md for the apt packages needed before pip install.
+
+numpy>=1.24
+moderngl>=5.8
+PyOpenGL>=3.1
+PyOpenGL-accelerate>=3.1
+plyfile>=1.0
+
+# Optional developer/test helpers:
+# scipy>=1.10      # Enables optional KD-tree benchmark path.
+# Pillow>=10.0     # Allows test_render_to_image.py to save screenshots.
